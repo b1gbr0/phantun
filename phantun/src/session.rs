@@ -1,0 +1,178 @@
+//! Session bookkeeping for the Phantun client.
+//!
+//! Every established fake-TCP session is represented by a [`Session`] record
+//! carrying a generation identifier and a cancellation token. The
+//! [`Connections`] table is the only place where session records are created
+//! and finished, so the manager task, the main loop and every worker share a
+//! single idempotent termination path.
+
+use std::collections::HashMap;
+use std::net::SocketAddr;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use tokio::sync::RwLock;
+use tokio_util::sync::CancellationToken;
+
+/// A single generation of a client session.
+///
+/// The record is created by [`Connections::register`] and stays usable until
+/// its cancellation token is triggered by [`Connections::finish`]. The payload
+/// is whatever the caller attaches to the session (the fake-TCP socket in the
+/// client), which keeps the bookkeeping itself independent of the transport.
+pub struct Session<T> {
+    generation: u64,
+    udp_remote_addr: SocketAddr,
+    cancel: CancellationToken,
+    payload: T,
+}
+
+impl<T> Session<T> {
+    /// Identifier of this generation, unique within the client process.
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Local UDP peer this session belongs to.
+    pub fn udp_remote_addr(&self) -> SocketAddr {
+        self.udp_remote_addr
+    }
+
+    /// Data attached to the session when it was registered.
+    pub fn payload(&self) -> &T {
+        &self.payload
+    }
+
+    /// Handle that cancels this generation when triggered.
+    pub fn cancel_token(&self) -> CancellationToken {
+        self.cancel.clone()
+    }
+
+    /// Resolves once this generation has been finished.
+    pub async fn cancelled(&self) {
+        self.cancel.cancelled().await;
+    }
+
+    /// Whether this generation has already been finished.
+    pub fn is_finished(&self) -> bool {
+        self.cancel.is_cancelled()
+    }
+}
+
+/// Table of live sessions, keyed by the local UDP peer address.
+///
+/// All session termination goes through [`Connections::finish`], which cancels
+/// the generation and removes the record only if it still belongs to that
+/// generation. Repeated and late calls are therefore harmless.
+pub struct Connections<T> {
+    next_generation: AtomicU64,
+    table: RwLock<HashMap<SocketAddr, Arc<Session<T>>>>,
+}
+
+impl<T> Connections<T> {
+    pub fn new() -> Self {
+        Self {
+            next_generation: AtomicU64::new(0),
+            table: RwLock::new(HashMap::new()),
+        }
+    }
+
+    /// Returns the live session for `udp_remote_addr`, if any.
+    ///
+    /// Finished sessions are never handed out, which keeps a terminated
+    /// generation from being used again.
+    pub async fn get(&self, udp_remote_addr: &SocketAddr) -> Option<Arc<Session<T>>> {
+        let table = self.table.read().await;
+        table
+            .get(udp_remote_addr)
+            .filter(|session| !session.is_finished())
+            .cloned()
+    }
+
+    /// Creates a new generation for `udp_remote_addr` and records it.
+    pub async fn register(&self, udp_remote_addr: SocketAddr, payload: T) -> Arc<Session<T>> {
+        let generation = self.next_generation.fetch_add(1, Ordering::Relaxed) + 1;
+        let session = Arc::new(Session {
+            generation,
+            udp_remote_addr,
+            cancel: CancellationToken::new(),
+            payload,
+        });
+
+        self.table
+            .write()
+            .await
+            .insert(udp_remote_addr, session.clone());
+
+        session
+    }
+
+    /// Finishes `session`: cancels the generation, interrupts pending work
+    /// waiting on its token and removes the record if it is still current.
+    ///
+    /// Returns `true` when the record of this generation was removed. The
+    /// function is idempotent: finishing an already finished generation, or
+    /// finishing an old generation after a new one took its place, leaves the
+    /// table untouched.
+    pub async fn finish(&self, session: &Session<T>) -> bool {
+        session.cancel.cancel();
+
+        let mut table = self.table.write().await;
+        let is_current = table
+            .get(&session.udp_remote_addr)
+            .is_some_and(|current| current.generation == session.generation);
+        if is_current {
+            table.remove(&session.udp_remote_addr);
+        }
+
+        is_current
+    }
+}
+
+impl<T> Default for Connections<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn peer() -> SocketAddr {
+        "192.0.2.10:1234".parse().unwrap()
+    }
+
+    #[tokio::test]
+    async fn repeated_finish_is_idempotent() {
+        let connections = Connections::<()>::new();
+        let session = connections.register(peer(), ()).await;
+
+        assert!(connections.get(&peer()).await.is_some());
+        assert!(connections.finish(&session).await);
+        assert!(session.is_finished());
+        assert!(connections.get(&peer()).await.is_none());
+
+        assert!(!connections.finish(&session).await);
+        assert!(connections.get(&peer()).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn late_finish_does_not_touch_new_generation() {
+        let connections = Connections::<()>::new();
+        let old = connections.register(peer(), ()).await;
+        assert!(connections.finish(&old).await);
+
+        let new = connections.register(peer(), ()).await;
+        assert_ne!(old.generation(), new.generation());
+
+        assert!(!connections.finish(&old).await);
+
+        let current = connections.get(&peer()).await.expect("new session is live");
+        assert_eq!(current.generation(), new.generation());
+        assert!(!current.is_finished());
+
+        assert!(connections.finish(&current).await);
+        assert!(connections.get(&peer()).await.is_none());
+    }
+}

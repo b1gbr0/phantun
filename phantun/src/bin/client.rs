@@ -2,19 +2,38 @@ use clap::{Arg, ArgAction, Command, crate_version};
 use fake_tcp::packet::MAX_PACKET_LEN;
 use fake_tcp::{Socket, Stack};
 use log::{debug, error, info, trace, warn};
+use phantun::session::{Connections, Session};
 use phantun::utils::{assign_ipv6_address, new_udp_reuseport, udp_recv_pktinfo};
-use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{Notify, RwLock};
+use tokio::sync::Notify;
 use tokio::time::{self, Instant};
 use tokio_tun::TunBuilder;
-use tokio_util::sync::CancellationToken;
 
 use phantun::UDP_TTL;
+
+type SocketSession = Session<Arc<Socket>>;
+
+/// Sends a datagram through the session socket unless the session is finished
+/// meanwhile, in which case the pending send is interrupted and `false` is
+/// returned.
+async fn send_session(session: &SocketSession, buf: &[u8]) -> bool {
+    tokio::select! {
+        _ = session.cancelled() => false,
+        res = session.payload().send(buf) => res.is_some(),
+    }
+}
+
+/// Keepalive counterpart of [`send_session`].
+async fn send_keepalive_session(session: &SocketSession) -> bool {
+    tokio::select! {
+        _ = session.cancelled() => false,
+        res = session.payload().send_keepalive() => res.is_some(),
+    }
+}
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
@@ -203,7 +222,7 @@ async fn main() -> io::Result<()> {
     info!("Created TUN device {}", tun[0].name());
 
     let udp_sock = Arc::new(new_udp_reuseport(local_addr));
-    let connections = Arc::new(RwLock::new(HashMap::<SocketAddr, Arc<Socket>>::new()));
+    let connections = Arc::new(Connections::<Arc<Socket>>::new());
 
     let mut stack = Stack::new(tun, tun_peer, tun_peer6);
 
@@ -217,8 +236,10 @@ async fn main() -> io::Result<()> {
             // 1. It is a new UDP connection, or
             // 2. It is some extra packets not filtered by more specific
             //    connected UDP socket yet
-            if let Some(sock) = connections.read().await.get(&udp_remote_addr) {
-                sock.send(&buf_r[..size]).await;
+            if let Some(session) = connections.get(&udp_remote_addr).await {
+                if !send_session(&session, &buf_r[..size]).await {
+                    connections.finish(&session).await;
+                }
                 continue;
             }
 
@@ -230,27 +251,24 @@ async fn main() -> io::Result<()> {
             }
 
             let sock = Arc::new(sock.unwrap());
+            let session = connections.register(udp_remote_addr, sock).await;
+
             if let Some(ref p) = handshake_packet {
-                if sock.send(p).await.is_none() {
+                if !send_session(&session, p).await {
                     error!("Failed to send handshake packet to remote, closing connection.");
+                    connections.finish(&session).await;
                     continue;
                 }
 
-                debug!("Sent handshake packet to: {}", sock);
+                debug!("Sent handshake packet to: {}", session.payload());
             }
 
             // send first packet
-            if sock.send(&buf_r[..size]).await.is_none() {
+            if !send_session(&session, &buf_r[..size]).await {
+                connections.finish(&session).await;
                 continue;
             }
 
-            assert!(
-                connections
-                    .write()
-                    .await
-                    .insert(udp_remote_addr, sock.clone())
-                    .is_none()
-            );
             debug!("inserted fake TCP socket into connection table");
 
             // spawn "fastpath" UDP socket and task, this will offload main task
@@ -258,11 +276,10 @@ async fn main() -> io::Result<()> {
 
             let data_received = Arc::new(Notify::new());
             let tcp_packet_received = Arc::new(Notify::new());
-            let quit = CancellationToken::new();
 
             for i in 0..num_cpus {
-                let sock = sock.clone();
-                let quit = quit.clone();
+                let session = session.clone();
+                let connections = connections.clone();
                 let data_received = data_received.clone();
                 let tcp_packet_received = tcp_packet_received.clone();
 
@@ -300,21 +317,21 @@ async fn main() -> io::Result<()> {
                     loop {
                         tokio::select! {
                             Ok(size) = udp_sock.recv(&mut buf_udp) => {
-                                if sock.send(&buf_udp[..size]).await.is_none() {
+                                if !send_session(&session, &buf_udp[..size]).await {
                                     debug!("removed fake TCP socket from connections table");
-                                    quit.cancel();
+                                    connections.finish(&session).await;
                                     return;
                                 }
 
                                 data_received.notify_one();
                             },
-                            res = sock.recv(&mut buf_tcp) => {
+                            res = session.payload().recv(&mut buf_tcp) => {
                                 match res {
                                     Some(size) => {
                                         if size > 0 {
                                             if let Err(e) = udp_sock.send(&buf_tcp[..size]).await {
                                                 error!("Unable to send UDP packet to {}: {}, closing connection", e, remote_addr);
-                                                quit.cancel();
+                                                connections.finish(&session).await;
                                                 return;
                                             }
                                             data_received.notify_one();
@@ -324,14 +341,14 @@ async fn main() -> io::Result<()> {
                                     },
                                     None => {
                                         debug!("removed fake TCP socket from connections table");
-                                        quit.cancel();
+                                        connections.finish(&session).await;
                                         return;
                                     },
                                 }
 
                                 tcp_packet_received.notify_one();
                             },
-                            _ = quit.cancelled() => {
+                            _ = session.cancelled() => {
                                 debug!("worker {} terminated", i);
                                 return;
                             },
@@ -359,12 +376,11 @@ async fn main() -> io::Result<()> {
                                 if tcp_idle > tcp_keepalive_time.unwrap() {
                                     if last_tcp_keepalive_sent.elapsed() >= tcp_keepalive_intvl {
                                         if probe_sent >= tcp_keepalive_retries {
-                                            info!("Connection {} TCP keep-alive retry exceeded", sock);
+                                            info!("Connection {} TCP keep-alive retry exceeded", session.payload());
                                             break;
                                         }
-                                        trace!("Connection {} sending keep-alive {} / {}", sock, probe_sent + 1, tcp_keepalive_retries);
-                                        let result = sock.send_keepalive().await;
-                                        if result.is_none() {
+                                        trace!("Connection {} sending keep-alive {} / {}", session.payload(), probe_sent + 1, tcp_keepalive_retries);
+                                        if !send_keepalive_session(&session).await {
                                             warn!("Failed to send keep-alive!");
                                         }
                                         probe_sent += 1;
@@ -375,11 +391,11 @@ async fn main() -> io::Result<()> {
 
                             if last_data_recv.elapsed() > UDP_TTL {
                                 // Execute every 1 sec, unless there's traffic
-                                info!("Connection {} No traffic seen in the last {:?}, closing connection", sock, UDP_TTL);
+                                info!("Connection {} No traffic seen in the last {:?}, closing connection", session.payload(), UDP_TTL);
                                 break;
                             }
                         },
-                        _ = quit.cancelled() => {
+                        _ = session.cancelled() => {
                             break;
                         },
                         _ = data_received_fut => {
@@ -391,9 +407,8 @@ async fn main() -> io::Result<()> {
                         },
                     }
                 }
-                debug!("removed fake TCP socket {} from connections table", sock);
-                connections.write().await.remove(&udp_remote_addr);
-                quit.cancel();
+                debug!("removed fake TCP socket {} from connections table", session.payload());
+                connections.finish(&session).await;
             });
         }
     });
