@@ -643,6 +643,7 @@ async fn run_manager<S: FakeTcpSocket>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex as StdMutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::{Mutex as AsyncMutex, Notify, mpsc};
 
@@ -675,22 +676,38 @@ mod tests {
         }
     }
 
+    /// How the fake fake-TCP socket answers a send.
+    #[derive(Clone, Copy)]
+    enum SendBehavior {
+        Ok,
+        /// The send never completes.
+        Hang,
+        /// The TUN write fails.
+        Fail,
+    }
+
     struct FakeSocket {
-        send_hangs: bool,
+        send_behavior: SendBehavior,
         send_started: Arc<Notify>,
+        /// Virtual times at which keepalive probes were sent.
+        probes: Arc<StdMutex<Vec<Instant>>>,
         recv_rx: AsyncMutex<mpsc::UnboundedReceiver<Vec<u8>>>,
     }
 
     impl FakeTcpSocket for FakeSocket {
         async fn send(&self, _payload: &[u8]) -> Option<()> {
-            if self.send_hangs {
-                self.send_started.notify_one();
-                return std::future::pending().await;
+            match self.send_behavior {
+                SendBehavior::Ok => Some(()),
+                SendBehavior::Hang => {
+                    self.send_started.notify_one();
+                    std::future::pending().await
+                }
+                SendBehavior::Fail => None,
             }
-            Some(())
         }
 
         async fn send_keepalive(&self) -> Option<()> {
+            self.probes.lock().unwrap().push(Instant::now());
             self.send(&[]).await
         }
 
@@ -708,7 +725,9 @@ mod tests {
 
     struct FakeConnector {
         connects: Arc<AtomicUsize>,
-        send_hangs: bool,
+        send_behavior: SendBehavior,
+        /// Makes the socket of the first connection fail its sends.
+        first_socket_fails: bool,
         send_started: Arc<Notify>,
     }
 
@@ -716,11 +735,17 @@ mod tests {
         type Socket = FakeSocket;
 
         async fn connect(&mut self, _remote: SocketAddr) -> Option<FakeSocket> {
-            self.connects.fetch_add(1, Ordering::SeqCst);
+            let index = self.connects.fetch_add(1, Ordering::SeqCst);
+            let send_behavior = if self.first_socket_fails && index == 0 {
+                SendBehavior::Fail
+            } else {
+                self.send_behavior
+            };
             let (_tx, rx) = mpsc::unbounded_channel();
             Some(FakeSocket {
-                send_hangs: self.send_hangs,
+                send_behavior,
                 send_started: self.send_started.clone(),
+                probes: Arc::new(StdMutex::new(Vec::new())),
                 recv_rx: AsyncMutex::new(rx),
             })
         }
@@ -780,18 +805,37 @@ mod tests {
     }
 
     fn fake_socket(
-        send_hangs: bool,
+        send_behavior: SendBehavior,
         send_started: Arc<Notify>,
     ) -> (FakeSocket, mpsc::UnboundedSender<Vec<u8>>) {
         let (tx, rx) = mpsc::unbounded_channel();
         (
             FakeSocket {
-                send_hangs,
+                send_behavior,
                 send_started,
+                probes: Arc::new(StdMutex::new(Vec::new())),
                 recv_rx: AsyncMutex::new(rx),
             },
             tx,
         )
+    }
+
+    fn keepalive_20_5_3() -> KeepaliveConfig {
+        KeepaliveConfig {
+            time: Duration::from_secs(20),
+            interval: Duration::from_secs(5),
+            retries: 3,
+        }
+    }
+
+    /// Virtual seconds at which keepalive probes were sent, relative to `t0`.
+    fn probe_offsets(probes: &StdMutex<Vec<Instant>>, t0: Instant) -> Vec<u64> {
+        probes
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|probe| (*probe - t0).as_secs())
+            .collect()
     }
 
     fn fake_peer(
@@ -836,7 +880,8 @@ mod tests {
         let send_started = Arc::new(Notify::new());
         let connector = FakeConnector {
             connects: connects.clone(),
-            send_hangs: true,
+            send_behavior: SendBehavior::Hang,
+            first_socket_fails: false,
             send_started: send_started.clone(),
         };
         let peers = FakePeerFactory {
@@ -881,7 +926,7 @@ mod tests {
         let peer = udp_peer();
         let connections = Arc::new(Connections::<Arc<FakeSocket>>::new());
         let send_started = Arc::new(Notify::new());
-        let (socket, _tcp_tx) = fake_socket(true, send_started.clone());
+        let (socket, _tcp_tx) = fake_socket(SendBehavior::Hang, send_started.clone());
         let session = connections.register(peer, Arc::new(socket)).await;
 
         let dropped = Arc::new(AtomicUsize::new(0));
@@ -907,7 +952,7 @@ mod tests {
         let peer = udp_peer();
         let connections = Arc::new(Connections::<Arc<FakeSocket>>::new());
         let send_started = Arc::new(Notify::new());
-        let (socket, tcp_tx) = fake_socket(false, Arc::new(Notify::new()));
+        let (socket, tcp_tx) = fake_socket(SendBehavior::Ok, Arc::new(Notify::new()));
         let session = connections.register(peer, Arc::new(socket)).await;
 
         let dropped = Arc::new(AtomicUsize::new(0));
@@ -931,7 +976,7 @@ mod tests {
     async fn worker_finishes_the_session_on_udp_recv_error() {
         let peer = udp_peer();
         let connections = Arc::new(Connections::<Arc<FakeSocket>>::new());
-        let (socket, _tcp_tx) = fake_socket(false, Arc::new(Notify::new()));
+        let (socket, _tcp_tx) = fake_socket(SendBehavior::Ok, Arc::new(Notify::new()));
         let session = connections.register(peer, Arc::new(socket)).await;
 
         let (worker_peer, udp_tx) = fake_peer(
@@ -954,6 +999,269 @@ mod tests {
             .unwrap();
 
         worker.await.unwrap();
+        assert!(session.is_finished());
+        assert!(connections.get(&peer).await.is_none());
+    }
+
+    async fn wait_for_generation<S>(
+        connections: &Connections<Arc<S>>,
+        peer: &SocketAddr,
+        generation: u64,
+    ) -> Arc<Session<Arc<S>>> {
+        for _ in 0..10_000 {
+            if let Some(session) = connections.get(peer).await
+                && session.generation() == generation
+            {
+                return session;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("generation {generation} for {peer} was not registered");
+    }
+
+    #[tokio::test]
+    async fn main_loop_finishes_the_session_on_a_tun_write_failure() {
+        let peer = udp_peer();
+        let (ingress_tx, ingress_rx) = mpsc::unbounded_channel();
+        let ingress = FakeIngress {
+            rx: AsyncMutex::new(ingress_rx),
+        };
+        let connections = Arc::new(Connections::<Arc<FakeSocket>>::new());
+        let connects = Arc::new(AtomicUsize::new(0));
+        let connector = FakeConnector {
+            connects: connects.clone(),
+            send_behavior: SendBehavior::Ok,
+            first_socket_fails: true,
+            send_started: Arc::new(Notify::new()),
+        };
+        let peers = FakePeerFactory {
+            dropped: Arc::new(AtomicUsize::new(0)),
+        };
+        let config = ClientConfig {
+            remote_addr: remote(),
+            handshake_packet: None,
+            num_workers: 1,
+            keepalive: None,
+        };
+
+        let main_loop = tokio::spawn(run(connector, ingress, peers, config, connections.clone()));
+
+        // The first datagram cannot be written to the TUN device, so its
+        // generation is given up instead of staying in the table.
+        ingress_tx.send((vec![1u8; 8], peer, udp_local())).unwrap();
+        for _ in 0..10_000 {
+            if connects.load(Ordering::SeqCst) == 1 && connections.get(&peer).await.is_none() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(connects.load(Ordering::SeqCst), 1);
+        assert!(connections.get(&peer).await.is_none());
+
+        // The next datagram establishes a new generation without a restart.
+        ingress_tx.send((vec![2u8; 8], peer, udp_local())).unwrap();
+        let second = wait_for_generation(&connections, &peer, 2).await;
+        assert!(!second.is_finished());
+
+        main_loop.abort();
+    }
+
+    #[tokio::test]
+    async fn worker_finishes_the_session_on_a_tun_write_failure() {
+        let peer = udp_peer();
+        let connections = Arc::new(Connections::<Arc<FakeSocket>>::new());
+        let (socket, _tcp_tx) = fake_socket(SendBehavior::Fail, Arc::new(Notify::new()));
+        let session = connections.register(peer, Arc::new(socket)).await;
+
+        let (worker_peer, udp_tx) = fake_peer(
+            false,
+            Arc::new(Notify::new()),
+            Arc::new(AtomicUsize::new(0)),
+        );
+        let worker = tokio::spawn(run_worker(
+            0,
+            session.clone(),
+            connections.clone(),
+            worker_peer,
+        ));
+
+        udp_tx.send(Ok(vec![7u8; 4])).unwrap();
+
+        worker.await.unwrap();
+        assert!(session.is_finished());
+        assert!(connections.get(&peer).await.is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn outgoing_activity_does_not_shift_probes_or_termination() {
+        let t0 = Instant::now();
+        let peer = udp_peer();
+        let connections = Arc::new(Connections::<Arc<FakeSocket>>::new());
+        let (socket, _tcp_tx) = fake_socket(SendBehavior::Ok, Arc::new(Notify::new()));
+        let probes = socket.probes.clone();
+        let session = connections.register(peer, Arc::new(socket)).await;
+
+        // Steady outgoing payload traffic, far more frequent than the probe
+        // interval.
+        let notifier = tokio::spawn({
+            let session = session.clone();
+            async move {
+                loop {
+                    time::sleep(Duration::from_secs(1)).await;
+                    session.notify_activity();
+                }
+            }
+        });
+
+        run_manager(
+            session.clone(),
+            connections.clone(),
+            Some(keepalive_20_5_3()),
+            t0,
+        )
+        .await;
+        notifier.abort();
+
+        assert_eq!(probe_offsets(&probes, t0), vec![20, 25, 30]);
+        assert_eq!((Instant::now() - t0).as_secs(), 35);
+        assert!(session.is_finished());
+        assert!(connections.get(&peer).await.is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn incoming_empty_ack_restarts_the_probe_budget() {
+        let t0 = Instant::now();
+        let peer = udp_peer();
+        let connections = Arc::new(Connections::<Arc<FakeSocket>>::new());
+        let (socket, tcp_tx) = fake_socket(SendBehavior::Ok, Arc::new(Notify::new()));
+        let probes = socket.probes.clone();
+        let session = connections.register(peer, Arc::new(socket)).await;
+
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let (worker_peer, _udp_tx) = fake_peer(false, Arc::new(Notify::new()), dropped);
+        let worker = tokio::spawn(run_worker(
+            0,
+            session.clone(),
+            connections.clone(),
+            worker_peer,
+        ));
+        let manager = tokio::spawn(run_manager(
+            session.clone(),
+            connections.clone(),
+            Some(keepalive_20_5_3()),
+            t0,
+        ));
+
+        // An empty fake-TCP ACK arrives before the second probe is due and
+        // restarts the whole budget from that moment.
+        time::sleep_until(t0 + Duration::from_secs(22)).await;
+        tcp_tx.send(Vec::new()).unwrap();
+
+        manager.await.unwrap();
+        worker.await.unwrap();
+
+        assert_eq!(probe_offsets(&probes, t0), vec![20, 42, 47, 52]);
+        assert_eq!((Instant::now() - t0).as_secs(), 57);
+        assert!(session.is_finished());
+        assert!(connections.get(&peer).await.is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_timeout_works_without_keepalive() {
+        let t0 = Instant::now();
+        let peer = udp_peer();
+        let connections = Arc::new(Connections::<Arc<FakeSocket>>::new());
+        let (socket, _tcp_tx) = fake_socket(SendBehavior::Ok, Arc::new(Notify::new()));
+        let session = connections.register(peer, Arc::new(socket)).await;
+
+        run_manager(session.clone(), connections.clone(), None, t0).await;
+
+        assert_eq!(Instant::now() - t0, UDP_TTL);
+        assert!(session.is_finished());
+        assert!(connections.get(&peer).await.is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_timeout_fires_while_the_keepalive_budget_stays_fresh() {
+        let t0 = Instant::now();
+        let peer = udp_peer();
+        let connections = Arc::new(Connections::<Arc<FakeSocket>>::new());
+        let (socket, _tcp_tx) = fake_socket(SendBehavior::Ok, Arc::new(Notify::new()));
+        let probes = socket.probes.clone();
+        let session = connections.register(peer, Arc::new(socket)).await;
+
+        // Incoming ACKs restart the probe budget often enough for no probe to
+        // ever be due.
+        let notifier = tokio::spawn({
+            let session = session.clone();
+            async move {
+                loop {
+                    time::sleep(Duration::from_secs(10)).await;
+                    session.notify_incoming();
+                }
+            }
+        });
+
+        run_manager(
+            session.clone(),
+            connections.clone(),
+            Some(keepalive_20_5_3()),
+            t0,
+        )
+        .await;
+        notifier.abort();
+
+        // Empty ACKs are not payload traffic, so the idle timeout still fires.
+        assert!(probe_offsets(&probes, t0).is_empty());
+        assert_eq!(Instant::now() - t0, UDP_TTL);
+        assert!(session.is_finished());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failed_keepalive_probe_finishes_the_session() {
+        let t0 = Instant::now();
+        let peer = udp_peer();
+        let connections = Arc::new(Connections::<Arc<FakeSocket>>::new());
+        let (socket, _tcp_tx) = fake_socket(SendBehavior::Fail, Arc::new(Notify::new()));
+        let probes = socket.probes.clone();
+        let session = connections.register(peer, Arc::new(socket)).await;
+
+        run_manager(
+            session.clone(),
+            connections.clone(),
+            Some(keepalive_20_5_3()),
+            t0,
+        )
+        .await;
+
+        assert_eq!(probe_offsets(&probes, t0), vec![20]);
+        assert_eq!((Instant::now() - t0).as_secs(), 20);
+        assert!(session.is_finished());
+        assert!(connections.get(&peer).await.is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stalled_keepalive_probe_finishes_the_session() {
+        let t0 = Instant::now();
+        let peer = udp_peer();
+        let connections = Arc::new(Connections::<Arc<FakeSocket>>::new());
+        let send_started = Arc::new(Notify::new());
+        let (socket, _tcp_tx) = fake_socket(SendBehavior::Hang, send_started.clone());
+        let session = connections.register(peer, Arc::new(socket)).await;
+
+        let manager = tokio::spawn(run_manager(
+            session.clone(),
+            connections.clone(),
+            Some(keepalive_20_5_3()),
+            t0,
+        ));
+        send_started.notified().await;
+        manager.await.unwrap();
+
+        assert_eq!(
+            Instant::now() - t0,
+            Duration::from_secs(20) + KEEPALIVE_SEND_TIMEOUT
+        );
         assert!(session.is_finished());
         assert!(connections.get(&peer).await.is_none());
     }
