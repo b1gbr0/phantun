@@ -140,15 +140,15 @@ to the stand log. Verified in Task 9:
 
 ### Task 5: automated tests
 
-- [ ] minimal seams for time and I/O results are introduced
-- [ ] test: frequent outgoing-traffic notifications do not move the probes
+- [x] minimal seams for time and I/O results are introduced
+- [x] test: frequent outgoing-traffic notifications do not move the probes
       and the termination
-- [ ] test: an incoming fake-TCP packet, an empty ACK included, resets the budget
-- [ ] test: the idle timeout works independently of keepalive
-- [ ] test: a send error, a UDP receive error and a hung keepalive send
+- [x] test: an incoming fake-TCP packet, an empty ACK included, resets the budget
+- [x] test: the idle timeout works independently of keepalive
+- [x] test: a send error, a UDP receive error and a hung keepalive send
       lead to the intended termination
-- [ ] test: a late cleanup does not remove the new session
-- [ ] the actual asynchronous manager loop is exercised, not only the
+- [x] test: a late cleanup does not remove the new session
+- [x] the actual asynchronous manager loop is exercised, not only the
       deadline-computation function; Tokio `test-util` is wired in where
       needed (the workspace currently sets only `features = ["full"]`,
       `Cargo.toml:9-10`)

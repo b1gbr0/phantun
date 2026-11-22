@@ -7,5 +7,5 @@ members = [
 ]
 
 [workspace.dependencies]
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", features = ["full", "test-util"] }
 log = "0"
