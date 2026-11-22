@@ -228,7 +228,7 @@ impl Socket {
 
                     let payload = tcp_packet.payload();
 
-                    let need_ack = if payload.len() == 0 {
+                    let need_ack = if payload.is_empty() {
                         let current_head = self.ack.load(Ordering::Relaxed);
                         // If it's a keep alive packet
                         let kp = tcp_packet.get_sequence() == current_head.wrapping_sub(1);
