@@ -155,13 +155,13 @@ to the stand log. Verified in Task 9:
 
 ### Task 6: stand environment contract
 
-- [ ] a Linux runner/VM with pre-authorised root or a non-interactive
+- [x] a Linux runner/VM with pre-authorised root or a non-interactive
       `sudo -n` is fixed
-- [ ] the presence of network namespaces, `/dev/net/tun`, `iproute2`, the
+- [x] the presence of network namespaces, `/dev/net/tun`, `iproute2`, the
       chosen firewall backend and a generic timeout tool is checked
-- [ ] Rust tooling and dependencies are prepared, or network access to fetch
+- [x] Rust tooling and dependencies are prepared, or network access to fetch
       them is allowed
-- [ ] when capabilities are missing — a non-zero exit, no interactive
+- [x] when capabilities are missing — a non-zero exit, no interactive
       prompts; skipping the stand does not count as acceptance
 
 ### Task 7: isolated stand
