@@ -9,7 +9,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use tokio::sync::{Notify, RwLock};
 use tokio_util::sync::CancellationToken;
@@ -24,6 +24,7 @@ pub struct Session<T> {
     generation: u64,
     udp_remote_addr: SocketAddr,
     cancel: CancellationToken,
+    end_reported: AtomicBool,
     activity: Notify,
     incoming: Notify,
     payload: T,
@@ -58,6 +59,15 @@ impl<T> Session<T> {
     /// Whether this generation has already been finished.
     pub fn is_finished(&self) -> bool {
         self.cancel.is_cancelled()
+    }
+
+    /// Claims the right to report the termination of this generation.
+    ///
+    /// Returns `true` for the first caller only. A termination path that ends
+    /// the session for a reason reports it when it wins the claim, so the
+    /// reason is logged even when another path removes the table entry first.
+    pub fn claim_end_report(&self) -> bool {
+        !self.end_reported.swap(true, Ordering::AcqRel)
     }
 
     /// Signals that a payload datagram of this session moved in either
@@ -120,6 +130,7 @@ impl<T> Connections<T> {
             generation,
             udp_remote_addr,
             cancel: CancellationToken::new(),
+            end_reported: AtomicBool::new(false),
             activity: Notify::new(),
             incoming: Notify::new(),
             payload,
@@ -155,6 +166,8 @@ impl<T> Connections<T> {
     }
 }
 
+/// Required by `clippy::new_without_default`: the table has no state to
+/// initialise beyond what [`Connections::new`] does.
 impl<T> Default for Connections<T> {
     fn default() -> Self {
         Self::new()
@@ -199,6 +212,49 @@ mod tests {
         assert!(!current.is_finished());
 
         assert!(connections.finish(&current).await);
+        assert!(connections.get(&peer()).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn end_report_is_claimed_only_once() {
+        let connections = Connections::<()>::new();
+        let session = connections.register(peer(), ()).await;
+
+        // The first path that knows a reason claims the report; a later
+        // termination attempt must not write a second record.
+        assert!(session.claim_end_report());
+        assert!(!session.claim_end_report());
+
+        assert!(connections.finish(&session).await);
+    }
+
+    #[tokio::test]
+    async fn end_report_claim_survives_a_competing_finish() {
+        let connections = Connections::<()>::new();
+        let session = connections.register(peer(), ()).await;
+
+        // The path that knows the reason claims the report, but a racing path
+        // observes the cancellation and removes the record first.
+        assert!(session.claim_end_report());
+        session.cancel_token().cancel();
+        assert!(connections.finish(&session).await);
+
+        // The reason is still nobody else's to report.
+        assert!(!session.claim_end_report());
+    }
+
+    #[tokio::test]
+    async fn get_hides_a_cancelled_session_before_it_is_finished() {
+        let connections = Connections::<()>::new();
+        let session = connections.register(peer(), ()).await;
+
+        // `finish` cancels before it takes the table lock, so `get` can run
+        // against a cancelled record that is still present.
+        session.cancel_token().cancel();
+        assert!(session.is_finished());
+        assert!(connections.get(&peer()).await.is_none());
+
+        assert!(connections.finish(&session).await);
         assert!(connections.get(&peer()).await.is_none());
     }
 }

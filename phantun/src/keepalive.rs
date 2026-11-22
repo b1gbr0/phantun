@@ -1,10 +1,10 @@
 //! Liveness probe schedule for fake-TCP sessions.
 //!
 //! The schedule is anchored to `t0`, the time of the last incoming fake-TCP
-//! packet (an empty ACK counts). Probes are due at `t0 + K + n * I` for
-//! `n = 0..R` and the session is given up at `t0 + K + R * I`, so outgoing
-//! traffic and late sends never postpone a probe or the termination. Every
-//! incoming fake-TCP packet restarts the budget from a new `t0`.
+//! packet (an empty ACK counts). Probes are due at `t0 + K + n * I` for `n`
+//! from `0` to `R - 1` and the session is given up at `t0 + K + R * I`, so
+//! outgoing traffic and late sends never postpone a probe or the termination.
+//! Every incoming fake-TCP packet restarts the budget from a new `t0`.
 
 use std::time::Duration;
 
@@ -21,9 +21,11 @@ pub struct KeepaliveTimer {
 
 impl KeepaliveTimer {
     /// `now` is the initial `t0`, fixed when the session is established.
+    ///
+    /// `retries` is the number of probes sent before the session is given up.
+    /// Zero is allowed and means the session is given up at the first deadline
+    /// without sending a probe.
     pub fn new(now: Instant, time: Duration, interval: Duration, retries: u32) -> Self {
-        assert!(retries > 0, "keepalive needs at least one retry");
-
         Self {
             last_incoming: now,
             time,
@@ -47,6 +49,15 @@ impl KeepaliveTimer {
     /// does not shift the following deadlines.
     pub fn next_deadline(&self) -> Instant {
         self.last_incoming + self.time + self.interval * self.probes_sent
+    }
+
+    /// Absolute time at which the retry budget runs out.
+    ///
+    /// Unlike [`Self::next_deadline`], this does not depend on the probes that
+    /// have already completed: a probe still in flight at this moment does not
+    /// postpone the termination.
+    pub fn exhaustion_deadline(&self) -> Instant {
+        self.last_incoming + self.time + self.interval * self.retries
     }
 
     /// Whether all retries have been used, making the next deadline the
@@ -112,7 +123,7 @@ mod tests {
     }
 
     #[test]
-    fn late_send_does_not_shift_later_deadlines() {
+    fn next_deadline_tracks_the_probe_count_not_the_send_time() {
         let t0 = Instant::now();
         let mut timer = KeepaliveTimer::new(t0, secs(20), secs(5), 3);
 
@@ -120,5 +131,26 @@ mod tests {
         // probe is still due at t0 + 25s rather than 29s.
         timer.probe_sent();
         assert_eq!(timer.next_deadline(), t0 + secs(25));
+    }
+
+    #[test]
+    fn exhaustion_deadline_ignores_completed_probes() {
+        let t0 = Instant::now();
+        let mut timer = KeepaliveTimer::new(t0, secs(20), secs(5), 3);
+        assert_eq!(timer.exhaustion_deadline(), t0 + secs(35));
+
+        // A probe that never completed leaves `probes_sent` behind, but the
+        // budget still runs out at the same absolute time.
+        timer.probe_sent();
+        assert_eq!(timer.exhaustion_deadline(), t0 + secs(35));
+    }
+
+    #[test]
+    fn zero_retries_gives_up_at_the_first_deadline() {
+        let t0 = Instant::now();
+        let timer = KeepaliveTimer::new(t0, secs(20), secs(5), 0);
+
+        assert!(timer.probes_exhausted());
+        assert_eq!(timer.next_deadline(), t0 + secs(20));
     }
 }

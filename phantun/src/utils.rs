@@ -13,12 +13,25 @@ use neli::{
 use nix::sys::socket::{
     CmsgIterator, ControlMessageOwned, MsgFlags, SockaddrLike, SockaddrStorage, cmsg_space,
 };
+use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::os::unix::io::AsRawFd;
 use tokio::io::Interest;
 use tokio::net::UdpSocket;
 
+/// Creates a UDP socket with `SO_REUSEPORT` bound to `local_addr`.
+///
+/// Intended for sockets created once at process start, where a failure leaves
+/// nothing to serve. Sockets created per session must use
+/// [`try_new_udp_reuseport`] instead, so a bind failure ends one session
+/// rather than the whole process.
 pub fn new_udp_reuseport(local_addr: SocketAddr) -> UdpSocket {
+    try_new_udp_reuseport(local_addr)
+        .unwrap_or_else(|e| panic!("unable to create UDP socket bound to {local_addr}: {e}"))
+}
+
+/// Fallible variant of [`new_udp_reuseport`].
+pub fn try_new_udp_reuseport(local_addr: SocketAddr) -> io::Result<UdpSocket> {
     let udp_sock = socket2::Socket::new(
         if local_addr.is_ipv4() {
             socket2::Domain::IPV4
@@ -27,30 +40,29 @@ pub fn new_udp_reuseport(local_addr: SocketAddr) -> UdpSocket {
         },
         socket2::Type::DGRAM,
         None,
-    )
-    .unwrap();
-    udp_sock.set_reuse_port(true).unwrap();
+    )?;
+    udp_sock.set_reuse_port(true)?;
     // from tokio-rs/mio/blob/master/src/sys/unix/net.rs
-    udp_sock.set_cloexec(true).unwrap();
-    udp_sock.set_nonblocking(true).unwrap();
+    udp_sock.set_cloexec(true)?;
+    udp_sock.set_nonblocking(true)?;
 
     // enable IP_PKTINFO/IPV6_PKTINFO delivery so we know the destination address of incoming
     // packets
     if local_addr.is_ipv4() {
         nix::sys::socket::setsockopt(&udp_sock, nix::sys::socket::sockopt::Ipv4PacketInfo, &true)
-            .unwrap();
+            .map_err(io::Error::from)?;
     } else {
         nix::sys::socket::setsockopt(
             &udp_sock,
             nix::sys::socket::sockopt::Ipv6RecvPacketInfo,
             &true,
         )
-        .unwrap();
+        .map_err(io::Error::from)?;
     }
 
-    udp_sock.bind(&socket2::SockAddr::from(local_addr)).unwrap();
+    udp_sock.bind(&socket2::SockAddr::from(local_addr))?;
     let udp_sock: std::net::UdpSocket = udp_sock.into();
-    udp_sock.try_into().unwrap()
+    udp_sock.try_into()
 }
 
 /// Similiar to `UdpSocket::recv_from()`, but returns a 3rd value `IPAddr`

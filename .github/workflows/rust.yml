@@ -16,6 +16,22 @@ jobs:
       with:
         toolchain: stable
     - name: Run lint
-      run: cargo clippy --verbose
+      run: cargo clippy --workspace --all-targets --locked --verbose -- -D warnings
     - name: Build
-      run: cargo build --verbose
+      run: cargo build --workspace --locked --verbose
+    - name: Test
+      run: cargo test --workspace --locked --verbose
+
+  stand-scripts:
+
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v5
+    - name: Syntax-check the stand scripts
+      run: |
+        bash -n stand/preflight.sh
+        bash -n stand/topology.sh
+        bash -n stand/run.sh
+    - name: Shellcheck the stand scripts
+      run: shellcheck -S warning stand/*.sh

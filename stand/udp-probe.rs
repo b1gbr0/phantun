@@ -59,9 +59,18 @@ fn drive(target: SocketAddr, interval: Duration) -> io::Result<()> {
         let now = Instant::now();
         if now >= next {
             counter += 1;
-            sock.send(&counter.to_be_bytes())?;
-            println!("send {} {}", now_us(), counter);
-            io::stdout().flush()?;
+            match sock.send(&counter.to_be_bytes()) {
+                Ok(_) => {
+                    println!("send {} {}", now_us(), counter);
+                    io::stdout().flush()?;
+                }
+                // The client may still be creating its TUN device before it
+                // binds the listening socket; the kernel then reports the
+                // ICMP port-unreachable on this connected socket. Keep
+                // probing instead of failing the readiness phase.
+                Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => {}
+                Err(error) => return Err(error),
+            }
             next += interval;
             // Never queue a burst after a stall: the next slot is measured
             // from the current time instead of the missed one.
@@ -88,7 +97,8 @@ fn drive(target: SocketAddr, interval: Duration) -> io::Result<()> {
             Ok(_) => {}
             Err(error)
                 if error.kind() == io::ErrorKind::WouldBlock
-                    || error.kind() == io::ErrorKind::TimedOut => {}
+                    || error.kind() == io::ErrorKind::TimedOut
+                    || error.kind() == io::ErrorKind::ConnectionRefused => {}
             Err(error) => return Err(error),
         }
     }

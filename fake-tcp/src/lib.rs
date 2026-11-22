@@ -149,17 +149,16 @@ impl Socket {
     }
 
     fn build_tcp_packet(&self, flags: u8, payload: Option<&[u8]>) -> Bytes {
+        self.build_tcp_packet_with_seq(self.seq.load(Ordering::Relaxed), flags, payload)
+    }
+
+    /// Builds a packet with a caller-provided sequence number, so a sender can
+    /// reserve its sequence range before the packet is constructed.
+    fn build_tcp_packet_with_seq(&self, seq: u32, flags: u8, payload: Option<&[u8]>) -> Bytes {
         let ack = self.ack.load(Ordering::Relaxed);
         self.last_ack.store(ack, Ordering::Relaxed);
 
-        build_tcp_packet(
-            self.local_addr,
-            self.remote_addr,
-            self.seq.load(Ordering::Relaxed),
-            ack,
-            flags,
-            payload,
-        )
+        build_tcp_packet(self.local_addr, self.remote_addr, seq, ack, flags, payload)
     }
 
     /// Sends a datagram to the other end.
@@ -172,8 +171,11 @@ impl Socket {
     pub async fn send(&self, payload: &[u8]) -> Option<()> {
         match self.state {
             State::Established => {
-                let buf = self.build_tcp_packet(tcp::TcpFlags::ACK, Some(payload));
-                self.seq.fetch_add(payload.len() as u32, Ordering::Relaxed);
+                // Reserve the sequence range before building the packet: with
+                // concurrent callers a load-then-add would hand the same
+                // sequence number to two packets.
+                let seq = self.seq.fetch_add(payload.len() as u32, Ordering::Relaxed);
+                let buf = self.build_tcp_packet_with_seq(seq, tcp::TcpFlags::ACK, Some(payload));
                 match self.tun.send(&buf).await {
                     Ok(_) => Some(()),
                     Err(e) => {
