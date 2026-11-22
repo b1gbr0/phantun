@@ -185,3 +185,54 @@ run directory. The run directory defaults to `${TMPDIR:-/tmp}/phantun-stand-<uid
 and can be overridden with `STAND_RUN_DIR`; the server log defaults to
 `<run directory>/server.log` and can be overridden with `STAND_SERVER_LOG`
 before setup.
+
+## Timed recovery run
+
+`stand/run.sh run` builds the workspace, compiles the small UDP helper from
+`stand/udp-probe.rs`, sets the topology up and runs the scenario the plan
+prescribes:
+
+- parameters `20/5/3` and one UDP datagram every 100 ms, driven from the
+  client namespace through the client's listening socket;
+- an echo responder in the server namespace stands in for the application
+  behind the tunnel;
+- once the first reply proves the session works, the old post-NAT 4-tuple is
+  taken from the server log and its reply direction is cut in the router
+  namespace (`drop --reply-only`), so the client's keepalive probes still
+  reach the server while every ACK and data reply is dropped.
+
+The run records the last old-session packet observed at the local UDP peer
+(the `t0` estimate) and the moment the DROP is installed, which bounds the
+same `t0` from above. The session must end with the
+`keepalive probes exhausted` record at `t0 + 20 + 3 x 5 = 35 s`, tolerance
+2 s. The client PID must stay alive throughout, and the DROP must still be in
+place with the old flow's replies counted. A new session with a different wire
+tuple must then appear, and at least 10 datagrams sent after it appears must
+be answered.
+
+Run limits are enforced by `timeout`: 120 s for the run itself, 20 s for
+initial readiness, 20 s for recovery, and a separate 10 s cleanup budget.
+A violated condition exits non-zero; logs are kept in `STAND_LOG_DIR`
+(default `$TMPDIR/phantun-stand-logs-UID/<timestamp>-run`). The directory
+holds `run.log`, `client.log`, `server.log`, `driver.log`, `echo.log`,
+`recovery.log` and `evidence.txt` with the tuple, `t0`, DROP and close
+timestamps, the dropped-packet counters and the post-recovery reply count.
+
+## Cleanup checks
+
+`stand/run.sh cleanup-check` sets the topology up once per exit mode and
+asserts that the trap removes every namespace and process within the 10 s
+cleanup budget:
+
+| Mode | Signal path | Expected exit |
+| --- | --- | --- |
+| `normal` | script returns by itself | 0 |
+| `error` | a failed check exits | 3 |
+| `term` | `SIGTERM` to the script | 143 |
+| `timeout` | external `timeout` sends `SIGTERM` | 124 |
+
+A process killed with `SIGKILL` cannot run its trap. For that case
+`stand/run.sh cleanup` is the external cleanup: it stops the stand binaries by
+path, tears the topology down, and exits non-zero if anything remains. Pass
+the same `STAND_RUN_DIR`, `STAND_CLIENT_NS`, `STAND_ROUTER_NS` and
+`STAND_SERVER_NS` as the killed run when they were overridden.

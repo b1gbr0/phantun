@@ -178,20 +178,20 @@ to the stand log. Verified in Task 9:
 
 ### Task 8: verifying stand run
 
-- [ ] parameters: `20/5/3`, UDP packets every 100 ms
-- [ ] the last incoming packet of the old session and the moment of DROP are
+- [x] parameters: `20/5/3`, UDP packets every 100 ms
+- [x] the last incoming packet of the old session and the moment of DROP are
       recorded
-- [ ] termination specifically by keepalive exhaustion is verified, then a new
+- [x] termination specifically by keepalive exhaustion is verified, then a new
       session and at least 10 answers to datagrams sent after it was
       established
-- [ ] the client PID and the DROP of the old flow are kept for the whole check
-- [ ] run limits: total — 120 s, initial readiness — 20 s, recovery — 20 s,
+- [x] the client PID and the DROP of the old flow are kept for the whole check
+- [x] run limits: total — 120 s, initial readiness — 20 s, recovery — 20 s,
       cleanup — a separate 10 s; the closing time is compared with `t0 + 35 s`
       and a 2 s tolerance
-- [ ] cleanup is verified separately for a normal exit, an error, `TERM`
+- [x] cleanup is verified separately for a normal exit, an error, `TERM`
       and a timeout; for a forced process kill an external cleanup or a
       disposable VM is provided
-- [ ] the script returns a non-zero code when conditions are violated and
+- [x] the script returns a non-zero code when conditions are violated and
       keeps the logs
 
 ### Task 9: acceptance criteria check
