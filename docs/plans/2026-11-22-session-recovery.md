@@ -80,14 +80,14 @@ to the stand log. Verified in Task 9:
 
 ### Task 1: session contract and a single termination path
 
-- [ ] a single idempotent session termination path is introduced, reachable
+- [x] a single idempotent session termination path is introduced, reachable
       from the manager, the main loop and all workers
-- [ ] the session record carries a generation id and a cancellation handle
-- [ ] termination forbids further use of the old record, cancels all of its
+- [x] the session record carries a generation id and a cancellation handle
+- [x] termination forbids further use of the old record, cancels all of its
       workers and interrupts pending sends — including a send from the main
       loop — and removes only the record of **the same generation**
-- [ ] late termination of an old session does not affect the new one
-- [ ] regression tests cover repeated termination and late cleanup
+- [x] late termination of an old session does not affect the new one
+- [x] regression tests cover repeated termination and late cleanup
 
 ### Task 2: a probe timer independent of traffic
 
