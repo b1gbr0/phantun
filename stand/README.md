@@ -172,7 +172,7 @@ stand/topology.sh old-tuple
 stand/topology.sh drop 172.31.0.2:34567 172.31.0.6:4567
 stand/topology.sh drop --reply-only 172.31.0.2:34567 172.31.0.6:4567
 stand/topology.sh drop-stats
-stand/topology.sh require-new-tuple 172.31.0.2:34567 172.31.0.6:4567
+stand/topology.sh require-new-tuple '172.31.0.2:34567 172.31.0.6:4567'
 stand/topology.sh drop-remove
 stand/topology.sh ns-exec client -- phantun-client --local 127.0.0.1:40001 ...
 stand/topology.sh teardown
@@ -213,10 +213,14 @@ be answered.
 Run limits are enforced by `timeout`: 120 s for the run itself, 20 s for
 initial readiness, 20 s for recovery, and a separate 10 s cleanup budget.
 A violated condition exits non-zero; logs are kept in `STAND_LOG_DIR`
-(default `$TMPDIR/phantun-stand-logs-UID/<timestamp>-run`). The directory
-holds `run.log`, `client.log`, `server.log`, `driver.log`, `echo.log`,
-`recovery.log` and `evidence.txt` with the tuple, `t0`, DROP and close
-timestamps, the dropped-packet counters and the post-recovery reply count.
+(default `$TMPDIR/phantun-stand-logs-UID/<timestamp>-PID`; set
+`STAND_LOG_ROOT` to change the parent directory). The timed run uses its own
+topology state directory, `$TMPDIR/phantun-stand-state-UID-PID`, with the
+server log inside the log directory; `STAND_RUN_DIR`, `STAND_LOG_DIR` and
+`STAND_SERVER_LOG` override these paths. The log directory holds `run.log`,
+`client.log`, `server.log`, `driver.log`, `echo.log`, `recovery.log` and
+`evidence.txt` with the tuple, `t0`, DROP and close timestamps, the
+dropped-packet counters and the post-recovery reply count.
 
 ## Cleanup checks
 

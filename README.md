@@ -23,6 +23,7 @@ A lightweight and fast UDP to TCP obfuscator.
     * [4. Start Phantun daemon](#4-start-phantun-daemon)
         * [Server](#server)
         * [Client](#client)
+            * [Client session keepalive and recovery](#client-session-keepalive-and-recovery)
 * [MTU overhead](#mtu-overhead)
     * [MTU calculation for WireGuard](#mtu-calculation-for-wireguard)
 * [Version compatibility](#version-compatibility)
@@ -252,6 +253,41 @@ RUST_LOG=info /usr/local/bin/phantun_client --local 127.0.0.1:1234 --remote exam
 
   Domain name with AAAA record is also supported.
 </details>
+
+#### Client session keepalive and recovery
+
+The client closes a fake-TCP session that stops receiving fake-TCP packets and
+opens a new session on the next local datagram, without restarting the process.
+Enable it with `--keepalive-time`:
+
+```
+RUST_LOG=info /usr/local/bin/phantun_client --local 127.0.0.1:1234 \
+  --remote 10.0.0.1:4567 --keepalive-time 20 --keepalive-interval 5 \
+  --keepalive-retries 3
+```
+
+* `--keepalive-time SECONDS` (alias `-k`) is the wait after the last incoming
+  fake-TCP packet before the first probe. Without it no probes are sent.
+* `--keepalive-interval SECONDS` (default 5) is the spacing between probes.
+* `--keepalive-retries N` (default 3, allowed 1 to 19) is the number of
+  unanswered probes before the session is closed.
+
+Probes are scheduled from the last incoming fake-TCP packet, and an empty ACK
+counts as incoming. Outgoing traffic does not postpone a probe or the close.
+After `N` unanswered probes the session is closed; the next local datagram
+opens a new session with a new local fake-TCP port. A probe that stays pending
+for 5 seconds also closes the session.
+
+The idle timeout runs independently of keepalive: a session with no payload
+traffic for 180 seconds is closed even when keepalive is disabled, and empty
+ACKs do not postpone it.
+
+Session termination is logged with the reason, the session generation and the
+local UDP peer, for example `keepalive probes exhausted`, `no traffic seen in
+the last 180s` or `unable to write datagram to the TUN device`.
+
+Limitation: a failure of the UDP to fake-TCP direction is not detected while
+the peer still answers keepalive probes with service ACKs.
 
 [Back to TOC](#table-of-contents)
 

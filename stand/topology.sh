@@ -85,6 +85,16 @@ state_error() {
     exit 2
 }
 
+# The state directory lives under a predictable path in $TMPDIR, so refuse
+# anything this user did not create: another local user could pre-create it
+# and plant an `env` file that would be sourced with our privileges.
+verify_state_path() {
+    local path=$1 kind=$2
+    [ -L "$path" ] && state_error "refusing to use symlinked $kind $path"
+    [ -O "$path" ] || state_error "refusing to use $kind $path: not owned by the current user"
+    return 0
+}
+
 command_name=${1:-}
 if [ -z "$command_name" ]; then
     usage
@@ -96,7 +106,10 @@ is_nft() { [ "${STAND_FIREWALL_BACKEND:-}" = nft ]; }
 load_sudo() {
     SUDO=()
     IPT=${STAND_FIREWALL_BACKEND:-iptables}
-    if [ "${STAND_PRIV:-}" = sudo-n ]; then
+    if [ -n "${STAND_SUDO:-}" ]; then
+        # The preflight contract already selected how to escalate.
+        read -r -a SUDO <<<"$STAND_SUDO"
+    elif [ "${STAND_PRIV:-}" = sudo-n ]; then
         SUDO=(sudo -n)
     fi
 }
@@ -113,11 +126,23 @@ nsrun() {
 
 load_env() {
     [ -f "$ENV_FILE" ] || state_error "no topology state at $ENV_FILE; run 'topology.sh setup' first"
-    # The state file is written by setup with printf %q and is trusted.
+    verify_state_path "$RUN_DIR" "run directory"
+    verify_state_path "$ENV_FILE" "state file"
+    # The state file is written by setup with printf %q and is trusted once
+    # the ownership checks above passed.
     # shellcheck disable=SC1090
     . "$ENV_FILE"
+    apply_state_names
     SERVER_LOG=${STAND_SERVER_LOG:-$RUN_DIR/server.log}
     load_sudo
+}
+
+# Names the namespaces from the state file, so every command operates on the
+# namespaces `setup` created even when the environment does not repeat them.
+apply_state_names() {
+    CLIENT_NS=${STAND_CLIENT_NS:-$CLIENT_NS}
+    ROUTER_NS=${STAND_ROUTER_NS:-$ROUTER_NS}
+    SERVER_NS=${STAND_SERVER_NS:-$SERVER_NS}
 }
 
 ns_exists() {
@@ -177,9 +202,16 @@ setup_iptables_nat() {
 }
 
 cmd_setup() {
-    # shellcheck disable=SC2046
-    eval "$("$SCRIPT_DIR/preflight.sh" --print-env)"
+    local contract
+    contract=$("$SCRIPT_DIR/preflight.sh" --print-env) \
+        || die "preflight failed; the stand cannot start"
+    eval "$contract"
     load_sudo
+
+    if [ -e "$RUN_DIR" ] || [ -L "$RUN_DIR" ]; then
+        [ -d "$RUN_DIR" ] || state_error "$RUN_DIR exists and is not a directory"
+        verify_state_path "$RUN_DIR" "run directory"
+    fi
 
     run ip netns list >/dev/null 2>&1 || die "network namespaces are not available"
     local ns
@@ -270,8 +302,11 @@ cmd_setup() {
 
 cmd_teardown() {
     if [ -f "$ENV_FILE" ]; then
+        verify_state_path "$RUN_DIR" "run directory"
+        verify_state_path "$ENV_FILE" "state file"
         # shellcheck disable=SC1090
         . "$ENV_FILE"
+        apply_state_names
         load_sudo
     fi
     destroy_namespaces
@@ -445,22 +480,12 @@ parse_side() {
         || state_error "bad $name address '$side', expected IPv4:PORT"
 }
 
-split_side() {
-    local side=$1 name=$2
-    parse_side "$side" "$name"
-    printf '%s %s\n' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"
-}
-
 cmd_drop() {
     local directions=both
     while [ $# -gt 0 ]; do
         case "$1" in
             --reply-only)
                 directions=reply
-                shift
-                ;;
-            --request-only)
-                directions=request
                 shift
                 ;;
             *) break ;;
@@ -482,13 +507,16 @@ cmd_drop() {
             ;;
     esac
     load_env
-    read -r c_addr c_port <<<"$(split_side "$client" client)"
-    read -r s_addr s_port <<<"$(split_side "$server" server)"
+    # Parse in this shell: `state_error` inside a command substitution would
+    # only exit the subshell and leave empty addresses behind.
+    parse_side "$client" client
+    local c_addr=${BASH_REMATCH[1]} c_port=${BASH_REMATCH[2]}
+    parse_side "$server" server
+    local s_addr=${BASH_REMATCH[1]} s_port=${BASH_REMATCH[2]}
 
     local want_request=0 want_reply=0
     case "$directions" in
         both) want_request=1; want_reply=1 ;;
-        request) want_request=1 ;;
         reply) want_reply=1 ;;
     esac
 

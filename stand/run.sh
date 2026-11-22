@@ -24,7 +24,7 @@
 #
 # Environment:
 #   STAND_LOG_ROOT   directory for kept logs (default: $TMPDIR/phantun-stand-logs-UID)
-#   STAND_LOG_DIR    exact log directory (default: $STAND_LOG_ROOT/<timestamp>-run)
+#   STAND_LOG_DIR    exact log directory (default: $STAND_LOG_ROOT/<timestamp>-PID)
 #   STAND_RUN_DIR    topology state directory (default: $TMPDIR/phantun-stand-state-UID-PID)
 #   STAND_ALLOW_NETWORK=1   allow preflight to fetch dependencies
 #   STAND_FIREWALL_BACKEND  pin the firewall backend
@@ -59,7 +59,8 @@ TOTAL_TIMEOUT_S=120
 CLEANUP_TIMEOUT_S=10
 
 LOG_ROOT=${STAND_LOG_ROOT:-${TMPDIR:-/tmp}/phantun-stand-logs-$(id -u)}
-TOOLS_DIR=${TMPDIR:-/tmp}/phantun-stand-tools-$(id -u)
+# TOOLS_DIR is resolved in bin_paths(), which refuses a path this user did not
+# create because rustc writes into it while the stand may run as root.
 
 SUDO=()
 CHILD_PIDS=()
@@ -96,7 +97,10 @@ die() {
 
 load_sudo() {
     SUDO=()
-    if [ "${STAND_PRIV:-}" = sudo-n ]; then
+    if [ -n "${STAND_SUDO:-}" ]; then
+        # The preflight contract already selected how to escalate.
+        read -r -a SUDO <<<"$STAND_SUDO"
+    elif [ "${STAND_PRIV:-}" = sudo-n ]; then
         SUDO=(sudo -n)
     fi
 }
@@ -104,7 +108,11 @@ load_sudo() {
 ns_exec() {
     local ns=$1
     shift
-    "${SUDO[@]}" ip netns exec "$ns" "$@"
+    # sudo resets the environment by default, so the log level has to be
+    # passed explicitly; without RUST_LOG the client and server would start at
+    # the error level and the readiness and exhaustion greps would never see
+    # the info lines they wait for.
+    "${SUDO[@]}" ip netns exec "$ns" env RUST_LOG="${RUST_LOG:-info}" "$@"
 }
 
 # --- preparation -----------------------------------------------------------
@@ -115,7 +123,7 @@ acquire_contract() {
     # The preflight output is KEY=VALUE with printf %q and is trusted.
     eval "$contract"
     load_sudo
-    export STAND_PRIV STAND_FIREWALL_BACKEND STAND_TIMEOUT STAND_PROJECT_ROOT STAND_ALLOW_NETWORK
+    export STAND_PRIV STAND_SUDO STAND_FIREWALL_BACKEND STAND_TIMEOUT STAND_PROJECT_ROOT STAND_ALLOW_NETWORK
 }
 
 bin_paths() {
@@ -127,7 +135,31 @@ bin_paths() {
     BIN_DIR=$target_dir/release
     CLIENT_BIN=$BIN_DIR/client
     SERVER_BIN=$BIN_DIR/server
+    resolve_tools_dir
     export BIN_DIR CLIENT_BIN SERVER_BIN TOOLS_DIR
+}
+
+# The stand may run as root (preflight picks PRIV_MODE=root for id 0), and
+# rustc writes an executable into this directory. In a world-writable $TMPDIR
+# another local user could pre-create the path and turn the build into a
+# root-owned file write (for example via a symlinked udp-probe). The path stays
+# stable so the external `cleanup` mode can still match leftover udp-probe
+# processes, but anything this user did not create, or a symlink, is refused;
+# a directory we created cannot be swapped afterwards in a sticky $TMPDIR.
+# topology.sh guards its state directory the same way.
+resolve_tools_dir() {
+    if [ -z "${TOOLS_DIR:-}" ]; then
+        TOOLS_DIR=${TMPDIR:-/tmp}/phantun-stand-tools-$(id -u)
+    fi
+    [ -L "$TOOLS_DIR" ] && die "refusing to use symlinked tools directory $TOOLS_DIR"
+    if [ -e "$TOOLS_DIR" ]; then
+        [ -d "$TOOLS_DIR" ] || die "refusing to use tools path $TOOLS_DIR: not a directory"
+        [ -O "$TOOLS_DIR" ] || die "refusing to use tools directory $TOOLS_DIR: not owned by the current user"
+        chmod 700 "$TOOLS_DIR" 2>/dev/null || true
+    else
+        mkdir -p "$TOOLS_DIR"
+    fi
+    return 0
 }
 
 prepare() {
@@ -154,7 +186,6 @@ init_logging() {
     LOG_DIR=${STAND_LOG_DIR:-$LOG_ROOT/$(date +%Y%m%d-%H%M%S)-$$}
     mkdir -p "$LOG_DIR"
     RUN_LOG=$LOG_DIR/run.log
-    : >"$RUN_LOG"
     STAND_RUN_DIR=${STAND_RUN_DIR:-${TMPDIR:-/tmp}/phantun-stand-state-$(id -u)-$$}
     export STAND_LOG_DIR=$LOG_DIR STAND_RUN_DIR STAND_SERVER_LOG=$LOG_DIR/server.log
     CLIENT_LOG=$LOG_DIR/client.log
@@ -162,12 +193,20 @@ init_logging() {
     ECHO_LOG=$LOG_DIR/echo.log
     DRIVER_LOG=$LOG_DIR/driver.log
     EVIDENCE=$LOG_DIR/evidence.txt
-    : >"$CLIENT_LOG"
-    : >"$SERVER_LOG"
-    : >"$ECHO_LOG"
-    : >"$DRIVER_LOG"
-    : >"$EVIDENCE"
-    log "log directory: $LOG_DIR"
+    # The child processes inherit STAND_LOG_DIR and call this again. Truncate
+    # only in the process that created the directory, so the parent's log
+    # (build output, scenario start) is not discarded by the child.
+    if [ "${STAND_LOG_READY:-}" != 1 ]; then
+        : >"$RUN_LOG"
+        : >"$CLIENT_LOG"
+        : >"$SERVER_LOG"
+        : >"$ECHO_LOG"
+        : >"$DRIVER_LOG"
+        : >"$EVIDENCE"
+        STAND_LOG_READY=1
+        export STAND_LOG_READY
+        log "log directory: $LOG_DIR"
+    fi
 }
 
 setup_topology() {
@@ -175,6 +214,9 @@ setup_topology() {
     log "topology: setup"
     if ! "$TOPOLOGY" setup >>"$RUN_LOG" 2>&1; then
         die "topology setup failed; see $RUN_LOG"
+    fi
+    if ! "$TOPOLOGY" check >>"$RUN_LOG" 2>&1; then
+        die "topology isolation check failed; see $RUN_LOG"
     fi
 }
 
@@ -230,6 +272,17 @@ kill_stand_processes() {
     done
 }
 
+stop_stand_processes() {
+    kill_stand_processes TERM
+    local tries=0
+    while [ "$tries" -lt 20 ]; do
+        processes_present || break
+        sleep 0.05
+        tries=$((tries + 1))
+    done
+    kill_stand_processes KILL
+}
+
 cleanup() {
     if [ "$CLEANED" -eq 1 ]; then
         return 0
@@ -243,14 +296,7 @@ cleanup() {
     for pid in ${CHILD_PIDS[@]+"${CHILD_PIDS[@]}"}; do
         kill "$pid" 2>/dev/null || true
     done
-    kill_stand_processes TERM
-    local tries=0
-    while [ "$tries" -lt 20 ]; do
-        processes_present || break
-        sleep 0.05
-        tries=$((tries + 1))
-    done
-    kill_stand_processes KILL
+    stop_stand_processes
     if [ "$TOPOLOGY_STARTED" -eq 1 ]; then
         "$STAND_TIMEOUT" "$CLEANUP_TIMEOUT_S" "$TOPOLOGY" teardown >>"$RUN_LOG" 2>&1 \
             || log "cleanup: topology teardown reported failure"
@@ -368,12 +414,21 @@ run_body() {
         || die "server did not start listening within ${READY_TIMEOUT_S}s"
 
     start_client
-    sleep 0.2
-    local pids
-    pids=$(client_pids)
-    if [ "$(count_lines "$pids")" -ne 1 ]; then
-        die "expected one client process, found '$pids'"
-    fi
+    local pids count
+    while :; do
+        pids=$(client_pids)
+        count=$(count_lines "$pids")
+        if [ "$count" -eq 1 ]; then
+            break
+        fi
+        if [ "$count" -gt 1 ]; then
+            die "expected one client process, found '$pids'"
+        fi
+        if [ "$(now_us)" -ge "$deadline" ]; then
+            die "client did not start within ${READY_TIMEOUT_S}s"
+        fi
+        sleep 0.1
+    done
     CLIENT_PID=$pids
     log "client: PID $CLIENT_PID, local UDP 127.0.0.1:$CLIENT_UDP_PORT in $env_client_ns"
 
@@ -639,9 +694,9 @@ run_cleanup_scenario() {
     export STAND_CLIENT_NS="pcc-$mode-client"
     export STAND_ROUTER_NS="pcc-$mode-router"
     export STAND_SERVER_NS="pcc-$mode-server"
-    mkdir -p "$dir"
-    RUN_LOG=$dir/run.log
-    : >"$RUN_LOG"
+    # Each scenario gets a fresh log directory, so let init_logging truncate.
+    unset STAND_LOG_READY
+    init_logging
 
     log "cleanup-check/$mode: starting"
     case "$mode" in
@@ -777,14 +832,7 @@ cmd_cleanup() {
     SERVER_NS=${STAND_SERVER_NS:-phantun-server}
 
     log "external cleanup: stopping stand processes"
-    kill_stand_processes TERM
-    local tries=0
-    while [ "$tries" -lt 20 ]; do
-        processes_present || break
-        sleep 0.05
-        tries=$((tries + 1))
-    done
-    kill_stand_processes KILL
+    stop_stand_processes
 
     log "external cleanup: removing the topology"
     "$STAND_TIMEOUT" "$CLEANUP_TIMEOUT_S" "$TOPOLOGY" teardown >>"$RUN_LOG" 2>&1 \

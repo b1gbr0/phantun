@@ -26,7 +26,7 @@ use tokio::time::{self, Instant};
 use crate::UDP_TTL;
 use crate::keepalive::KeepaliveTimer;
 use crate::session::{Connections, Session};
-use crate::utils::{new_udp_reuseport, udp_recv_pktinfo};
+use crate::utils::{try_new_udp_reuseport, udp_recv_pktinfo};
 
 /// Upper bound on how long a keepalive probe may stay in flight. A probe still
 /// pending after this is treated as a failed send and the generation is
@@ -130,39 +130,48 @@ impl PeerFactory for BindPeerFactory {
         udp_remote_addr: SocketAddr,
         udp_local_addr: IpAddr,
     ) -> io::Result<UdpSocket> {
-        // Always reply from the same address that the peer used to communicate with
-        // us. This avoids a frequent problem with IPv6 privacy extensions when we
-        // erroneously bind to wrong short-lived temporary address even if the peer
-        // explicitly used a persistent address to communicate to us.
-        //
-        // To do so, first bind to (<incoming packet dst_ip>, <local addr port>), and then
-        // connect to (<incoming packet src_ip>, <incoming packet src_port>).
-        let bind_addr = match (udp_remote_addr, udp_local_addr) {
-            (SocketAddr::V4(_), IpAddr::V4(udp_local_ipv4)) => {
-                SocketAddr::V4(SocketAddrV4::new(udp_local_ipv4, self.local_port))
-            }
-            (SocketAddr::V6(udp_remote_addr), IpAddr::V6(udp_local_ipv6)) => {
-                SocketAddr::V6(SocketAddrV6::new(
-                    udp_local_ipv6,
-                    self.local_port,
-                    udp_remote_addr.flowinfo(),
-                    udp_remote_addr.scope_id(),
-                ))
-            }
-            (_, _) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!(
-                        "unexpected family combination for udp_remote_addr={udp_remote_addr} and udp_local_addr={udp_local_addr}"
-                    ),
-                ));
-            }
-        };
+        let bind_addr = local_bind_addr(udp_remote_addr, udp_local_addr, self.local_port)?;
 
-        let udp_sock = new_udp_reuseport(bind_addr);
+        let udp_sock = try_new_udp_reuseport(bind_addr)?;
         udp_sock.connect(udp_remote_addr).await?;
 
         Ok(udp_sock)
+    }
+}
+
+/// Bind address of a fast-path socket: the address the peer used to reach us.
+///
+/// Always reply from the same address that the peer used to communicate with
+/// us. This avoids a frequent problem with IPv6 privacy extensions when we
+/// erroneously bind to wrong short-lived temporary address even if the peer
+/// explicitly used a persistent address to communicate to us.
+///
+/// To do so, first bind to (`incoming packet dst_ip`, `local addr port`), and
+/// then connect to (`incoming packet src_ip`, `incoming packet src_port`).
+fn local_bind_addr(
+    udp_remote_addr: SocketAddr,
+    udp_local_addr: IpAddr,
+    local_port: u16,
+) -> io::Result<SocketAddr> {
+    match (udp_remote_addr, udp_local_addr) {
+        (SocketAddr::V4(_), IpAddr::V4(udp_local_ipv4)) => Ok(SocketAddr::V4(SocketAddrV4::new(
+            udp_local_ipv4,
+            local_port,
+        ))),
+        (SocketAddr::V6(udp_remote_addr), IpAddr::V6(udp_local_ipv6)) => {
+            Ok(SocketAddr::V6(SocketAddrV6::new(
+                udp_local_ipv6,
+                local_port,
+                udp_remote_addr.flowinfo(),
+                udp_remote_addr.scope_id(),
+            )))
+        }
+        (_, _) => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "unexpected family combination for udp_remote_addr={udp_remote_addr} and udp_local_addr={udp_local_addr}"
+            ),
+        )),
     }
 }
 
@@ -209,7 +218,7 @@ enum SessionEnd {
     IdleTimeout,
     /// A write to the TUN device failed; the field says what was written.
     TunWriteFailed(&'static str),
-    /// A keepalive probe stayed pending longer than [`KEEPALIVE_SEND_TIMEOUT`].
+    /// A TUN write stayed pending longer than [`KEEPALIVE_SEND_TIMEOUT`].
     SendTimedOut,
     /// Receiving from the local UDP peer failed.
     UdpRecvFailed(io::Error),
@@ -233,7 +242,7 @@ impl SessionEnd {
             Self::IdleTimeout => format!("no traffic seen in the last {UDP_TTL:?}"),
             Self::TunWriteFailed(what) => format!("unable to write {what} to the TUN device"),
             Self::SendTimedOut => {
-                format!("keepalive probe still pending after {KEEPALIVE_SEND_TIMEOUT:?}")
+                format!("TUN write still pending after {KEEPALIVE_SEND_TIMEOUT:?}")
             }
             Self::UdpRecvFailed(error) => format!("unable to receive local datagram: {error}"),
             Self::FakeTcpRecvClosed => "fake-TCP receive closed".to_owned(),
@@ -243,19 +252,28 @@ impl SessionEnd {
 
 /// Finishes `session` with one log record naming the reason, the session
 /// generation and the local UDP peer.
+///
+/// The record is written by the first termination path that has a reason, not
+/// by the path that removed the table entry: another path can observe the
+/// cancellation and remove the record before this one takes the lock, and the
+/// reason must survive that. Concurrent termination attempts still produce a
+/// single record.
 async fn end_session<S: FakeTcpSocket>(
     connections: &Connections<Arc<S>>,
     session: &Session<Arc<S>>,
     reason: SessionEnd,
 ) {
-    log::log!(
-        reason.level(),
-        "Session {} for local UDP peer {}: {}, closing session",
-        session.generation(),
-        session.udp_remote_addr(),
-        reason.describe()
-    );
+    let report = session.claim_end_report();
     connections.finish(session).await;
+    if report {
+        log::log!(
+            reason.level(),
+            "Session {} for local UDP peer {}: {}, closing session",
+            session.generation(),
+            session.udp_remote_addr(),
+            reason.describe()
+        );
+    }
 }
 
 /// Sends a datagram of `session`, interrupted as soon as the generation is
@@ -268,6 +286,21 @@ async fn send_payload<S: FakeTcpSocket>(session: &Session<Arc<S>>, payload: &[u8
             None => PayloadSend::Failed,
         },
     }
+}
+
+/// Sends one of the first datagrams of a new generation.
+///
+/// The liveness manager, which is the only other path that could finish the
+/// generation, is spawned after these sends, so they are bounded explicitly:
+/// a TUN write stuck on the handshake or the first datagram must not pin the
+/// main loop.
+async fn send_initial<S: FakeTcpSocket>(
+    session: &Session<Arc<S>>,
+    payload: &[u8],
+) -> Option<PayloadSend> {
+    time::timeout(KEEPALIVE_SEND_TIMEOUT, send_payload(session, payload))
+        .await
+        .ok()
 }
 
 async fn send_keepalive<S: FakeTcpSocket>(session: &Session<Arc<S>>) -> Option<()> {
@@ -341,7 +374,11 @@ where
         let session = connections.register(udp_remote_addr, Arc::new(sock)).await;
 
         if let Some(ref packet) = config.handshake_packet {
-            match send_payload(&session, packet).await {
+            let Some(outcome) = send_initial(&session, packet).await else {
+                end_session(&connections, &session, SessionEnd::SendTimedOut).await;
+                continue;
+            };
+            match outcome {
                 PayloadSend::Sent => {
                     debug!("Sent handshake packet for session {}", session.generation())
                 }
@@ -362,7 +399,11 @@ where
         }
 
         // send first packet
-        match send_payload(&session, &buf_r[..size]).await {
+        let Some(outcome) = send_initial(&session, &buf_r[..size]).await else {
+            end_session(&connections, &session, SessionEnd::SendTimedOut).await;
+            continue;
+        };
+        match outcome {
             PayloadSend::Sent => {
                 session.notify_activity();
                 debug!("inserted fake TCP socket into connection table");
@@ -535,6 +576,12 @@ async fn run_manager<S: FakeTcpSocket>(
                 probe_deadline,
             } = probe;
             let idle_deadline = last_data_recv + UDP_TTL;
+            // A probe in flight does not postpone the exhaustion deadline: if
+            // the retry budget runs out while the send is still pending, the
+            // session is given up then, not when the send times out.
+            let exhaustion_deadline = keepalive
+                .as_ref()
+                .map(KeepaliveTimer::exhaustion_deadline);
             let mut requeue = false;
 
             tokio::select! {
@@ -554,6 +601,11 @@ async fn run_manager<S: FakeTcpSocket>(
                 }
                 _ = time::sleep_until(send_deadline) => {
                     break Some(SessionEnd::SendTimedOut);
+                }
+                _ = time::sleep_until(exhaustion_deadline.unwrap_or(idle_deadline)),
+                    if exhaustion_deadline.is_some() =>
+                {
+                    break Some(SessionEnd::KeepaliveExhausted);
                 }
                 _ = time::sleep_until(idle_deadline) => {
                     break Some(SessionEnd::IdleTimeout);
@@ -644,7 +696,7 @@ async fn run_manager<S: FakeTcpSocket>(
 mod tests {
     use super::*;
     use std::sync::Mutex as StdMutex;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use tokio::sync::{Mutex as AsyncMutex, Notify, mpsc};
 
     fn udp_peer() -> SocketAddr {
@@ -682,6 +734,9 @@ mod tests {
         Ok,
         /// The send never completes.
         Hang,
+        /// The send stays pending until the test opens the `released` gate,
+        /// then stays released for every later send.
+        Hold,
         /// The TUN write fails.
         Fail,
     }
@@ -691,19 +746,38 @@ mod tests {
         send_started: Arc<Notify>,
         /// Virtual times at which keepalive probes were sent.
         probes: Arc<StdMutex<Vec<Instant>>>,
+        /// Payloads the session wrote to the fake-TCP connection.
+        sent: Arc<StdMutex<Vec<Vec<u8>>>>,
+        /// Whether a closed test channel means "peer closed the connection"
+        /// instead of "stay pending".
+        close_recv_on_empty: bool,
+        /// Gate that releases a [`SendBehavior::Hold`] send.
+        release: Arc<Notify>,
+        released: Arc<AtomicBool>,
         recv_rx: AsyncMutex<mpsc::UnboundedReceiver<Vec<u8>>>,
     }
 
     impl FakeTcpSocket for FakeSocket {
-        async fn send(&self, _payload: &[u8]) -> Option<()> {
+        async fn send(&self, payload: &[u8]) -> Option<()> {
             match self.send_behavior {
-                SendBehavior::Ok => Some(()),
+                SendBehavior::Ok => {}
                 SendBehavior::Hang => {
                     self.send_started.notify_one();
                     std::future::pending().await
                 }
-                SendBehavior::Fail => None,
+                SendBehavior::Hold => {
+                    while !self.released.load(Ordering::SeqCst) {
+                        let notified = self.release.notified();
+                        if self.released.load(Ordering::SeqCst) {
+                            break;
+                        }
+                        notified.await;
+                    }
+                }
+                SendBehavior::Fail => return None,
             }
+            self.sent.lock().unwrap().push(payload.to_vec());
+            Some(())
         }
 
         async fn send_keepalive(&self) -> Option<()> {
@@ -718,7 +792,13 @@ mod tests {
                     buf[..size].copy_from_slice(&payload[..size]);
                     Some(size)
                 }
-                None => std::future::pending().await,
+                None => {
+                    if self.close_recv_on_empty {
+                        None
+                    } else {
+                        std::future::pending().await
+                    }
+                }
             }
         }
     }
@@ -729,6 +809,8 @@ mod tests {
         /// Makes the socket of the first connection fail its sends.
         first_socket_fails: bool,
         send_started: Arc<Notify>,
+        /// Payloads written by every socket this connector produced.
+        sent: Arc<StdMutex<Vec<Vec<u8>>>>,
     }
 
     impl FakeTcpConnector for FakeConnector {
@@ -746,6 +828,10 @@ mod tests {
                 send_behavior,
                 send_started: self.send_started.clone(),
                 probes: Arc::new(StdMutex::new(Vec::new())),
+                sent: self.sent.clone(),
+                close_recv_on_empty: false,
+                release: Arc::new(Notify::new()),
+                released: Arc::new(AtomicBool::new(false)),
                 recv_rx: AsyncMutex::new(rx),
             })
         }
@@ -754,8 +840,11 @@ mod tests {
     struct FakePeer {
         recv_rx: AsyncMutex<mpsc::UnboundedReceiver<io::Result<Vec<u8>>>>,
         send_hangs: bool,
+        send_fails: bool,
         send_started: Arc<Notify>,
         dropped: Arc<AtomicUsize>,
+        /// Datagrams written to the local UDP peer.
+        sent: Arc<StdMutex<Vec<Vec<u8>>>>,
     }
 
     impl Drop for FakePeer {
@@ -777,29 +866,44 @@ mod tests {
             }
         }
 
-        async fn send(&self, _buf: &[u8]) -> io::Result<usize> {
+        async fn send(&self, buf: &[u8]) -> io::Result<usize> {
             if self.send_hangs {
                 self.send_started.notify_one();
                 return std::future::pending().await;
             }
-            Ok(0)
+            if self.send_fails {
+                return Err(io::Error::new(io::ErrorKind::BrokenPipe, "boom"));
+            }
+            self.sent.lock().unwrap().push(buf.to_vec());
+            Ok(buf.len())
         }
     }
 
     struct FakePeerFactory {
         dropped: Arc<AtomicUsize>,
+        created: Arc<AtomicUsize>,
+        create_fails: bool,
     }
 
     impl PeerFactory for FakePeerFactory {
         type Peer = FakePeer;
 
         async fn create(&self, _remote: SocketAddr, _local: IpAddr) -> io::Result<FakePeer> {
+            self.created.fetch_add(1, Ordering::SeqCst);
+            if self.create_fails {
+                return Err(io::Error::new(
+                    io::ErrorKind::AddrNotAvailable,
+                    "cannot bind",
+                ));
+            }
             let (_tx, rx) = mpsc::unbounded_channel();
             Ok(FakePeer {
                 recv_rx: AsyncMutex::new(rx),
                 send_hangs: false,
+                send_fails: false,
                 send_started: Arc::new(Notify::new()),
                 dropped: self.dropped.clone(),
+                sent: Arc::new(StdMutex::new(Vec::new())),
             })
         }
     }
@@ -808,12 +912,24 @@ mod tests {
         send_behavior: SendBehavior,
         send_started: Arc<Notify>,
     ) -> (FakeSocket, mpsc::UnboundedSender<Vec<u8>>) {
+        fake_socket_with(send_behavior, send_started, false)
+    }
+
+    fn fake_socket_with(
+        send_behavior: SendBehavior,
+        send_started: Arc<Notify>,
+        close_recv_on_empty: bool,
+    ) -> (FakeSocket, mpsc::UnboundedSender<Vec<u8>>) {
         let (tx, rx) = mpsc::unbounded_channel();
         (
             FakeSocket {
                 send_behavior,
                 send_started,
                 probes: Arc::new(StdMutex::new(Vec::new())),
+                sent: Arc::new(StdMutex::new(Vec::new())),
+                close_recv_on_empty,
+                release: Arc::new(Notify::new()),
+                released: Arc::new(AtomicBool::new(false)),
                 recv_rx: AsyncMutex::new(rx),
             },
             tx,
@@ -843,15 +959,34 @@ mod tests {
         send_started: Arc<Notify>,
         dropped: Arc<AtomicUsize>,
     ) -> (FakePeer, mpsc::UnboundedSender<io::Result<Vec<u8>>>) {
+        let (peer, tx, _sent) = fake_peer_full(send_hangs, false, send_started, dropped);
+        (peer, tx)
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn fake_peer_full(
+        send_hangs: bool,
+        send_fails: bool,
+        send_started: Arc<Notify>,
+        dropped: Arc<AtomicUsize>,
+    ) -> (
+        FakePeer,
+        mpsc::UnboundedSender<io::Result<Vec<u8>>>,
+        Arc<StdMutex<Vec<Vec<u8>>>>,
+    ) {
         let (tx, rx) = mpsc::unbounded_channel();
+        let sent = Arc::new(StdMutex::new(Vec::new()));
         (
             FakePeer {
                 recv_rx: AsyncMutex::new(rx),
                 send_hangs,
+                send_fails,
                 send_started,
                 dropped,
+                sent: sent.clone(),
             },
             tx,
+            sent,
         )
     }
 
@@ -883,9 +1018,12 @@ mod tests {
             send_behavior: SendBehavior::Hang,
             first_socket_fails: false,
             send_started: send_started.clone(),
+            sent: Arc::new(StdMutex::new(Vec::new())),
         };
         let peers = FakePeerFactory {
             dropped: Arc::new(AtomicUsize::new(0)),
+            created: Arc::new(AtomicUsize::new(0)),
+            create_fails: false,
         };
         let config = ClientConfig {
             remote_addr: remote(),
@@ -917,6 +1055,49 @@ mod tests {
                 .generation(),
             second.generation()
         );
+
+        main_loop.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn main_loop_finishes_the_session_when_the_first_datagram_send_stalls() {
+        let peer = udp_peer();
+        let (ingress_tx, ingress_rx) = mpsc::unbounded_channel();
+        let ingress = FakeIngress {
+            rx: AsyncMutex::new(ingress_rx),
+        };
+        let connections = Arc::new(Connections::<Arc<FakeSocket>>::new());
+        let send_started = Arc::new(Notify::new());
+        let connector = FakeConnector {
+            connects: Arc::new(AtomicUsize::new(0)),
+            send_behavior: SendBehavior::Hang,
+            first_socket_fails: false,
+            send_started: send_started.clone(),
+            sent: Arc::new(StdMutex::new(Vec::new())),
+        };
+        let peers = FakePeerFactory {
+            dropped: Arc::new(AtomicUsize::new(0)),
+            created: Arc::new(AtomicUsize::new(0)),
+            create_fails: false,
+        };
+        let config = ClientConfig {
+            remote_addr: remote(),
+            handshake_packet: None,
+            num_workers: 1,
+            keepalive: None,
+        };
+
+        let main_loop = tokio::spawn(run(connector, ingress, peers, config, connections.clone()));
+
+        ingress_tx.send((vec![1u8; 8], peer, udp_local())).unwrap();
+        let session = wait_for_session(&connections, &peer).await;
+        send_started.notified().await;
+
+        // The TUN write never completes and no manager exists yet to cancel
+        // it; the bounded initial send gives up on its own.
+        time::sleep(KEEPALIVE_SEND_TIMEOUT + Duration::from_secs(1)).await;
+        assert!(session.is_finished());
+        assert!(connections.get(&peer).await.is_none());
 
         main_loop.abort();
     }
@@ -1033,9 +1214,12 @@ mod tests {
             send_behavior: SendBehavior::Ok,
             first_socket_fails: true,
             send_started: Arc::new(Notify::new()),
+            sent: Arc::new(StdMutex::new(Vec::new())),
         };
         let peers = FakePeerFactory {
             dropped: Arc::new(AtomicUsize::new(0)),
+            created: Arc::new(AtomicUsize::new(0)),
+            create_fails: false,
         };
         let config = ClientConfig {
             remote_addr: remote(),
@@ -1172,10 +1356,12 @@ mod tests {
         let peer = udp_peer();
         let connections = Arc::new(Connections::<Arc<FakeSocket>>::new());
         let (socket, _tcp_tx) = fake_socket(SendBehavior::Ok, Arc::new(Notify::new()));
+        let probes = socket.probes.clone();
         let session = connections.register(peer, Arc::new(socket)).await;
 
         run_manager(session.clone(), connections.clone(), None, t0).await;
 
+        assert!(probe_offsets(&probes, t0).is_empty());
         assert_eq!(Instant::now() - t0, UDP_TTL);
         assert!(session.is_finished());
         assert!(connections.get(&peer).await.is_none());
@@ -1264,5 +1450,413 @@ mod tests {
         );
         assert!(session.is_finished());
         assert!(connections.get(&peer).await.is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn keepalive_exhaustion_is_not_blocked_by_a_pending_probe() {
+        let t0 = Instant::now();
+        let peer = udp_peer();
+        let connections = Arc::new(Connections::<Arc<FakeSocket>>::new());
+        let send_started = Arc::new(Notify::new());
+        let (socket, _tcp_tx) = fake_socket(SendBehavior::Hang, send_started.clone());
+        let session = connections.register(peer, Arc::new(socket)).await;
+
+        let manager = tokio::spawn(run_manager(
+            session.clone(),
+            connections.clone(),
+            Some(KeepaliveConfig {
+                time: Duration::from_secs(20),
+                interval: Duration::from_secs(1),
+                retries: 3,
+            }),
+            t0,
+        ));
+        send_started.notified().await;
+        manager.await.unwrap();
+
+        // The probe due at t0 + 20s never completes, but the budget still runs
+        // out at t0 + 23s instead of waiting for the send timeout at t0 + 25s.
+        assert_eq!(Instant::now() - t0, Duration::from_secs(23));
+        assert!(session.is_finished());
+        assert!(connections.get(&peer).await.is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_late_probe_send_does_not_shift_the_next_probe() {
+        let t0 = Instant::now();
+        let peer = udp_peer();
+        let connections = Arc::new(Connections::<Arc<FakeSocket>>::new());
+        let (socket, _tcp_tx) = fake_socket(SendBehavior::Hold, Arc::new(Notify::new()));
+        let probes = socket.probes.clone();
+        let release = socket.release.clone();
+        let released = socket.released.clone();
+        let session = connections.register(peer, Arc::new(socket)).await;
+
+        let manager = tokio::spawn(run_manager(
+            session.clone(),
+            connections.clone(),
+            Some(keepalive_20_5_3()),
+            t0,
+        ));
+
+        // The probe due at t0 + 20s only completes at t0 + 24s; the next
+        // probe must still be due at t0 + 25s.
+        time::sleep_until(t0 + Duration::from_secs(24)).await;
+        released.store(true, Ordering::SeqCst);
+        release.notify_one();
+        manager.await.unwrap();
+
+        assert_eq!(probe_offsets(&probes, t0), vec![20, 25, 30]);
+        assert_eq!((Instant::now() - t0).as_secs(), 35);
+        assert!(session.is_finished());
+        assert!(connections.get(&peer).await.is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_incoming_packet_during_a_probe_send_keeps_the_restarted_budget() {
+        let t0 = Instant::now();
+        let peer = udp_peer();
+        let connections = Arc::new(Connections::<Arc<FakeSocket>>::new());
+        let (socket, _tcp_tx) = fake_socket(SendBehavior::Hold, Arc::new(Notify::new()));
+        let probes = socket.probes.clone();
+        let release = socket.release.clone();
+        let released = socket.released.clone();
+        let session = connections.register(peer, Arc::new(socket)).await;
+
+        let manager = tokio::spawn(run_manager(
+            session.clone(),
+            connections.clone(),
+            Some(keepalive_20_5_3()),
+            t0,
+        ));
+
+        // The probe due at t0 + 20s is still in flight when an incoming packet
+        // restarts the budget at t0 + 21s.
+        time::sleep_until(t0 + Duration::from_secs(21)).await;
+        assert_eq!(probe_offsets(&probes, t0), vec![20]);
+        session.notify_incoming();
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        released.store(true, Ordering::SeqCst);
+        release.notify_one();
+        manager.await.unwrap();
+
+        // The probe of the old budget is not counted: probes are due 20s after
+        // the restart and the session ends 15s later.
+        assert_eq!(probe_offsets(&probes, t0), vec![20, 41, 46, 51]);
+        assert_eq!((Instant::now() - t0).as_secs(), 56);
+        assert!(session.is_finished());
+        assert!(connections.get(&peer).await.is_none());
+    }
+
+    #[test]
+    fn local_bind_addr_mirrors_the_incoming_destination() {
+        let remote: SocketAddr = "192.0.2.10:1234".parse().unwrap();
+        let local: IpAddr = "192.0.2.1".parse().unwrap();
+        assert_eq!(
+            local_bind_addr(remote, local, 4567).unwrap(),
+            "192.0.2.1:4567".parse::<SocketAddr>().unwrap()
+        );
+
+        let remote6: SocketAddr = "[fe80::2%7]:1234".parse().unwrap();
+        let local6: IpAddr = "2001:db8::1".parse().unwrap();
+        match local_bind_addr(remote6, local6, 4567).unwrap() {
+            SocketAddr::V6(bound) => {
+                assert_eq!(bound.ip(), &local6);
+                assert_eq!(bound.port(), 4567);
+                assert_eq!(bound.scope_id(), 7);
+            }
+            other => panic!("expected an IPv6 bind address, got {other}"),
+        }
+    }
+
+    #[test]
+    fn local_bind_addr_rejects_mixed_families() {
+        let remote: SocketAddr = "192.0.2.10:1234".parse().unwrap();
+        let local6: IpAddr = "2001:db8::1".parse().unwrap();
+        assert_eq!(
+            local_bind_addr(remote, local6, 4567).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
+
+    #[tokio::test]
+    async fn worker_forwards_a_fake_tcp_payload_to_the_local_peer() {
+        let peer = udp_peer();
+        let connections = Arc::new(Connections::<Arc<FakeSocket>>::new());
+        let (socket, tcp_tx) = fake_socket(SendBehavior::Ok, Arc::new(Notify::new()));
+        let session = connections.register(peer, Arc::new(socket)).await;
+
+        let (worker_peer, _udp_tx, peer_sent) = fake_peer_full(
+            false,
+            false,
+            Arc::new(Notify::new()),
+            Arc::new(AtomicUsize::new(0)),
+        );
+        let worker = tokio::spawn(run_worker(
+            0,
+            session.clone(),
+            connections.clone(),
+            worker_peer,
+        ));
+
+        tcp_tx.send(vec![9u8, 8, 7]).unwrap();
+        for _ in 0..10_000 {
+            if !peer_sent.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        assert_eq!(*peer_sent.lock().unwrap(), vec![vec![9u8, 8, 7]]);
+        assert!(!session.is_finished());
+
+        assert!(connections.finish(&session).await);
+        worker.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn worker_finishes_the_session_when_the_fake_tcp_receive_closes() {
+        let peer = udp_peer();
+        let connections = Arc::new(Connections::<Arc<FakeSocket>>::new());
+        let (socket, tcp_tx) = fake_socket_with(SendBehavior::Ok, Arc::new(Notify::new()), true);
+        drop(tcp_tx);
+        let session = connections.register(peer, Arc::new(socket)).await;
+
+        let (worker_peer, _udp_tx) = fake_peer(
+            false,
+            Arc::new(Notify::new()),
+            Arc::new(AtomicUsize::new(0)),
+        );
+        let worker = tokio::spawn(run_worker(
+            0,
+            session.clone(),
+            connections.clone(),
+            worker_peer,
+        ));
+
+        worker.await.unwrap();
+        assert!(session.is_finished());
+        assert!(connections.get(&peer).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn worker_finishes_the_session_on_a_local_udp_send_error() {
+        let peer = udp_peer();
+        let connections = Arc::new(Connections::<Arc<FakeSocket>>::new());
+        let (socket, tcp_tx) = fake_socket(SendBehavior::Ok, Arc::new(Notify::new()));
+        let session = connections.register(peer, Arc::new(socket)).await;
+
+        let (worker_peer, _udp_tx, _sent) = fake_peer_full(
+            false,
+            true,
+            Arc::new(Notify::new()),
+            Arc::new(AtomicUsize::new(0)),
+        );
+        let worker = tokio::spawn(run_worker(
+            0,
+            session.clone(),
+            connections.clone(),
+            worker_peer,
+        ));
+
+        tcp_tx.send(vec![7u8; 4]).unwrap();
+        worker.await.unwrap();
+        assert!(session.is_finished());
+        assert!(connections.get(&peer).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn main_loop_sends_the_handshake_and_first_datagram_and_starts_workers() {
+        let peer = udp_peer();
+        let (ingress_tx, ingress_rx) = mpsc::unbounded_channel();
+        let ingress = FakeIngress {
+            rx: AsyncMutex::new(ingress_rx),
+        };
+        let connections = Arc::new(Connections::<Arc<FakeSocket>>::new());
+        let connects = Arc::new(AtomicUsize::new(0));
+        let sent = Arc::new(StdMutex::new(Vec::new()));
+        let connector = FakeConnector {
+            connects: connects.clone(),
+            send_behavior: SendBehavior::Ok,
+            first_socket_fails: false,
+            send_started: Arc::new(Notify::new()),
+            sent: sent.clone(),
+        };
+        let created = Arc::new(AtomicUsize::new(0));
+        let peers = FakePeerFactory {
+            dropped: Arc::new(AtomicUsize::new(0)),
+            created: created.clone(),
+            create_fails: false,
+        };
+        let config = ClientConfig {
+            remote_addr: remote(),
+            handshake_packet: Some(vec![0xAA]),
+            num_workers: 2,
+            keepalive: None,
+        };
+
+        let main_loop = tokio::spawn(run(connector, ingress, peers, config, connections.clone()));
+
+        ingress_tx
+            .send((vec![1u8, 2, 3], peer, udp_local()))
+            .unwrap();
+        for _ in 0..10_000 {
+            let ready = connects.load(Ordering::SeqCst) == 1
+                && created.load(Ordering::SeqCst) == 2
+                && sent.lock().unwrap().len() >= 2;
+            if ready {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        assert_eq!(
+            sent.lock().unwrap().clone(),
+            vec![vec![0xAAu8], vec![1u8, 2, 3]]
+        );
+        assert_eq!(created.load(Ordering::SeqCst), 2);
+        assert!(connections.get(&peer).await.is_some());
+
+        main_loop.abort();
+    }
+
+    #[tokio::test]
+    async fn main_loop_drops_the_session_when_the_handshake_send_fails() {
+        let peer = udp_peer();
+        let (ingress_tx, ingress_rx) = mpsc::unbounded_channel();
+        let ingress = FakeIngress {
+            rx: AsyncMutex::new(ingress_rx),
+        };
+        let connections = Arc::new(Connections::<Arc<FakeSocket>>::new());
+        let connects = Arc::new(AtomicUsize::new(0));
+        let connector = FakeConnector {
+            connects: connects.clone(),
+            send_behavior: SendBehavior::Fail,
+            first_socket_fails: false,
+            send_started: Arc::new(Notify::new()),
+            sent: Arc::new(StdMutex::new(Vec::new())),
+        };
+        let peers = FakePeerFactory {
+            dropped: Arc::new(AtomicUsize::new(0)),
+            created: Arc::new(AtomicUsize::new(0)),
+            create_fails: false,
+        };
+        let config = ClientConfig {
+            remote_addr: remote(),
+            handshake_packet: Some(vec![0xAA]),
+            num_workers: 1,
+            keepalive: None,
+        };
+
+        let main_loop = tokio::spawn(run(connector, ingress, peers, config, connections.clone()));
+
+        ingress_tx.send((vec![1u8; 8], peer, udp_local())).unwrap();
+        for _ in 0..10_000 {
+            if connects.load(Ordering::SeqCst) == 1 && connections.get(&peer).await.is_none() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        assert_eq!(connects.load(Ordering::SeqCst), 1);
+        assert!(connections.get(&peer).await.is_none());
+
+        main_loop.abort();
+    }
+
+    #[tokio::test]
+    async fn main_loop_finishes_the_session_when_a_fastpath_socket_cannot_be_created() {
+        let peer = udp_peer();
+        let (ingress_tx, ingress_rx) = mpsc::unbounded_channel();
+        let ingress = FakeIngress {
+            rx: AsyncMutex::new(ingress_rx),
+        };
+        let connections = Arc::new(Connections::<Arc<FakeSocket>>::new());
+        let connects = Arc::new(AtomicUsize::new(0));
+        let connector = FakeConnector {
+            connects: connects.clone(),
+            send_behavior: SendBehavior::Ok,
+            first_socket_fails: false,
+            send_started: Arc::new(Notify::new()),
+            sent: Arc::new(StdMutex::new(Vec::new())),
+        };
+        let created = Arc::new(AtomicUsize::new(0));
+        let peers = FakePeerFactory {
+            dropped: Arc::new(AtomicUsize::new(0)),
+            created: created.clone(),
+            create_fails: true,
+        };
+        let config = ClientConfig {
+            remote_addr: remote(),
+            handshake_packet: None,
+            num_workers: 1,
+            keepalive: None,
+        };
+
+        let main_loop = tokio::spawn(run(connector, ingress, peers, config, connections.clone()));
+
+        ingress_tx.send((vec![1u8; 8], peer, udp_local())).unwrap();
+        for _ in 0..10_000 {
+            if connects.load(Ordering::SeqCst) == 1
+                && created.load(Ordering::SeqCst) >= 1
+                && connections.get(&peer).await.is_none()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        assert_eq!(created.load(Ordering::SeqCst), 1);
+        assert!(connections.get(&peer).await.is_none());
+
+        main_loop.abort();
+    }
+
+    #[test]
+    fn session_end_reasons_are_distinguishable() {
+        assert_eq!(SessionEnd::KeepaliveExhausted.level(), log::Level::Info);
+        assert_eq!(
+            SessionEnd::KeepaliveExhausted.describe(),
+            "keepalive probes exhausted"
+        );
+
+        assert_eq!(SessionEnd::IdleTimeout.level(), log::Level::Info);
+        assert!(
+            SessionEnd::IdleTimeout
+                .describe()
+                .contains("no traffic seen")
+        );
+
+        assert_eq!(
+            SessionEnd::TunWriteFailed("datagram").level(),
+            log::Level::Error
+        );
+        assert_eq!(
+            SessionEnd::TunWriteFailed("datagram").describe(),
+            "unable to write datagram to the TUN device"
+        );
+
+        assert_eq!(SessionEnd::SendTimedOut.level(), log::Level::Warn);
+        assert!(
+            SessionEnd::SendTimedOut
+                .describe()
+                .contains("still pending after")
+        );
+
+        let error = io::Error::new(io::ErrorKind::ConnectionReset, "reset");
+        assert_eq!(SessionEnd::UdpRecvFailed(error).level(), log::Level::Error);
+        assert!(
+            SessionEnd::UdpRecvFailed(io::Error::new(io::ErrorKind::ConnectionReset, "reset"))
+                .describe()
+                .contains("reset")
+        );
+
+        assert_eq!(SessionEnd::FakeTcpRecvClosed.level(), log::Level::Debug);
+        assert_eq!(
+            SessionEnd::FakeTcpRecvClosed.describe(),
+            "fake-TCP receive closed"
+        );
     }
 }
