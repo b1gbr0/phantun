@@ -2,6 +2,7 @@ use clap::{Arg, ArgAction, Command, crate_version};
 use fake_tcp::packet::MAX_PACKET_LEN;
 use fake_tcp::{Socket, Stack};
 use log::{debug, error, info, trace, warn};
+use phantun::keepalive::KeepaliveTimer;
 use phantun::session::{Connections, Session};
 use phantun::utils::{assign_ipv6_address, new_udp_reuseport, udp_recv_pktinfo};
 use std::fs;
@@ -251,6 +252,9 @@ async fn main() -> io::Result<()> {
             }
 
             let sock = Arc::new(sock.unwrap());
+            // Initial anchor of the liveness schedule: the handshake just
+            // completed, so the last incoming fake-TCP packet is the SYN+ACK.
+            let established_at = Instant::now();
             let session = connections.register(udp_remote_addr, sock).await;
 
             if let Some(ref p) = handshake_packet {
@@ -358,39 +362,44 @@ async fn main() -> io::Result<()> {
             }
 
             let connections = connections.clone();
+            let keepalive_retries = tcp_keepalive_retries as u32;
             tokio::spawn(async move {
-                let mut last_tcp_recv = Instant::now();
                 let mut last_data_recv = Instant::now();
-                let mut probe_sent = 0;
-                let mut last_tcp_keepalive_sent = Instant::now();
+                let mut keepalive = tcp_keepalive_time.map(|time| {
+                    KeepaliveTimer::new(
+                        established_at,
+                        time,
+                        tcp_keepalive_intvl,
+                        keepalive_retries,
+                    )
+                });
+
                 loop {
-                    let tm0 = time::sleep(Duration::from_secs(1));
-                    let data_received_fut = data_received.notified();
-                    let tcp_packet_received_fut = tcp_packet_received.notified();
+                    let idle_deadline = last_data_recv + UDP_TTL;
+                    let probe_deadline = keepalive.as_ref().map(KeepaliveTimer::next_deadline);
+                    let deadline = probe_deadline.map_or(idle_deadline, |p| p.min(idle_deadline));
 
                     tokio::select! {
-                        _ = tm0 => {
+                        _ = time::sleep_until(deadline) => {
+                            let now = Instant::now();
 
-                            if tcp_keepalive_time.is_some() {
-                                let tcp_idle = last_tcp_recv.elapsed();
-                                if tcp_idle > tcp_keepalive_time.unwrap() {
-                                    if last_tcp_keepalive_sent.elapsed() >= tcp_keepalive_intvl {
-                                        if probe_sent >= tcp_keepalive_retries {
-                                            info!("Connection {} TCP keep-alive retry exceeded", session.payload());
-                                            break;
-                                        }
-                                        trace!("Connection {} sending keep-alive {} / {}", session.payload(), probe_sent + 1, tcp_keepalive_retries);
-                                        if !send_keepalive_session(&session).await {
-                                            warn!("Failed to send keep-alive!");
-                                        }
-                                        probe_sent += 1;
-                                        last_tcp_keepalive_sent = Instant::now();
-                                    }
+                            if let Some(timer) = keepalive.as_mut()
+                                && now >= timer.next_deadline()
+                            {
+                                if timer.probes_exhausted() {
+                                    info!("Connection {} TCP keep-alive retry exceeded", session.payload());
+                                    break;
                                 }
+
+                                trace!("Connection {} sending keep-alive {} / {}", session.payload(), timer.probes_sent() + 1, keepalive_retries);
+                                if !send_keepalive_session(&session).await {
+                                    warn!("Connection {} failed to send keep-alive, closing connection", session.payload());
+                                    break;
+                                }
+                                timer.probe_sent();
                             }
 
-                            if last_data_recv.elapsed() > UDP_TTL {
-                                // Execute every 1 sec, unless there's traffic
+                            if now >= idle_deadline {
                                 info!("Connection {} No traffic seen in the last {:?}, closing connection", session.payload(), UDP_TTL);
                                 break;
                             }
@@ -398,12 +407,13 @@ async fn main() -> io::Result<()> {
                         _ = session.cancelled() => {
                             break;
                         },
-                        _ = data_received_fut => {
+                        _ = data_received.notified() => {
                             last_data_recv = Instant::now();
                         },
-                        _ = tcp_packet_received_fut => {
-                            last_tcp_recv = Instant::now();
-                            probe_sent = 0;
+                        _ = tcp_packet_received.notified() => {
+                            if let Some(timer) = keepalive.as_mut() {
+                                timer.on_incoming(Instant::now());
+                            }
                         },
                     }
                 }
