@@ -1,40 +1,15 @@
 use clap::{Arg, ArgAction, Command, crate_version};
-use fake_tcp::packet::MAX_PACKET_LEN;
 use fake_tcp::{Socket, Stack};
-use log::{debug, error, info, trace, warn};
-use phantun::keepalive::KeepaliveTimer;
-use phantun::session::{Connections, Session};
-use phantun::utils::{assign_ipv6_address, new_udp_reuseport, udp_recv_pktinfo};
+use log::info;
+use phantun::client::{BindPeerFactory, ClientConfig, KeepaliveConfig};
+use phantun::session::Connections;
+use phantun::utils::{assign_ipv6_address, new_udp_reuseport};
 use std::fs;
 use std::io;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
+use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::Notify;
-use tokio::time::{self, Instant};
 use tokio_tun::TunBuilder;
-
-use phantun::UDP_TTL;
-
-type SocketSession = Session<Arc<Socket>>;
-
-/// Sends a datagram through the session socket unless the session is finished
-/// meanwhile, in which case the pending send is interrupted and `false` is
-/// returned.
-async fn send_session(session: &SocketSession, buf: &[u8]) -> bool {
-    tokio::select! {
-        _ = session.cancelled() => false,
-        res = session.payload().send(buf) => res.is_some(),
-    }
-}
-
-/// Keepalive counterpart of [`send_session`].
-async fn send_keepalive_session(session: &SocketSession) -> bool {
-    tokio::select! {
-        _ = session.cancelled() => false,
-        res = session.payload().send_keepalive() => res.is_some(),
-    }
-}
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
@@ -225,203 +200,25 @@ async fn main() -> io::Result<()> {
     let udp_sock = Arc::new(new_udp_reuseport(local_addr));
     let connections = Arc::new(Connections::<Arc<Socket>>::new());
 
-    let mut stack = Stack::new(tun, tun_peer, tun_peer6);
+    let stack = Stack::new(tun, tun_peer, tun_peer6);
 
-    let main_loop = tokio::spawn(async move {
-        let mut buf_r = [0u8; MAX_PACKET_LEN];
+    let config = ClientConfig {
+        remote_addr,
+        handshake_packet,
+        num_workers: num_cpus,
+        keepalive: tcp_keepalive_time.map(|time| KeepaliveConfig {
+            time,
+            interval: tcp_keepalive_intvl,
+            retries: tcp_keepalive_retries as u32,
+        }),
+    };
 
-        loop {
-            let (size, udp_remote_addr, udp_local_addr) =
-                udp_recv_pktinfo(&udp_sock, &mut buf_r).await?;
-            // seen UDP packet to listening socket, this means:
-            // 1. It is a new UDP connection, or
-            // 2. It is some extra packets not filtered by more specific
-            //    connected UDP socket yet
-            if let Some(session) = connections.get(&udp_remote_addr).await {
-                if !send_session(&session, &buf_r[..size]).await {
-                    connections.finish(&session).await;
-                }
-                continue;
-            }
-
-            info!("New UDP client from {}", udp_remote_addr);
-            let sock = stack.connect(remote_addr).await;
-            if sock.is_none() {
-                error!("Unable to connect to remote {}", remote_addr);
-                continue;
-            }
-
-            let sock = Arc::new(sock.unwrap());
-            // Initial anchor of the liveness schedule: the handshake just
-            // completed, so the last incoming fake-TCP packet is the SYN+ACK.
-            let established_at = Instant::now();
-            let session = connections.register(udp_remote_addr, sock).await;
-
-            if let Some(ref p) = handshake_packet {
-                if !send_session(&session, p).await {
-                    error!("Failed to send handshake packet to remote, closing connection.");
-                    connections.finish(&session).await;
-                    continue;
-                }
-
-                debug!("Sent handshake packet to: {}", session.payload());
-            }
-
-            // send first packet
-            if !send_session(&session, &buf_r[..size]).await {
-                connections.finish(&session).await;
-                continue;
-            }
-
-            debug!("inserted fake TCP socket into connection table");
-
-            // spawn "fastpath" UDP socket and task, this will offload main task
-            // from forwarding UDP packets
-
-            let data_received = Arc::new(Notify::new());
-            let tcp_packet_received = Arc::new(Notify::new());
-
-            for i in 0..num_cpus {
-                let session = session.clone();
-                let connections = connections.clone();
-                let data_received = data_received.clone();
-                let tcp_packet_received = tcp_packet_received.clone();
-
-                tokio::spawn(async move {
-                    let mut buf_udp = [0u8; MAX_PACKET_LEN];
-                    let mut buf_tcp = [0u8; MAX_PACKET_LEN];
-                    // Always reply from the same address that the peer used to communicate with
-                    // us. This avoids a frequent problem with IPv6 privacy extensions when we
-                    // erroneously bind to wrong short-lived temporary address even if the peer
-                    // explicitly used a persistent address to communicate to us.
-                    //
-                    // To do so, first bind to (<incoming packet dst_ip>, <local addr port>), and then
-                    // connect to (<incoming packet src_ip>, <incoming packet src_port>).
-                    let bind_addr = match (udp_remote_addr, udp_local_addr) {
-                        (SocketAddr::V4(_), IpAddr::V4(udp_local_ipv4)) => {
-                            SocketAddr::V4(SocketAddrV4::new(udp_local_ipv4, local_addr.port()))
-                        }
-                        (SocketAddr::V6(udp_remote_addr), IpAddr::V6(udp_local_ipv6)) => {
-                            SocketAddr::V6(SocketAddrV6::new(
-                                udp_local_ipv6,
-                                local_addr.port(),
-                                udp_remote_addr.flowinfo(),
-                                udp_remote_addr.scope_id(),
-                            ))
-                        }
-                        (_, _) => {
-                            panic!(
-                                "unexpected family combination for udp_remote_addr={udp_remote_addr} and udp_local_addr={udp_local_addr}"
-                            );
-                        }
-                    };
-                    let udp_sock = new_udp_reuseport(bind_addr);
-                    udp_sock.connect(udp_remote_addr).await.unwrap();
-
-                    loop {
-                        tokio::select! {
-                            Ok(size) = udp_sock.recv(&mut buf_udp) => {
-                                if !send_session(&session, &buf_udp[..size]).await {
-                                    debug!("removed fake TCP socket from connections table");
-                                    connections.finish(&session).await;
-                                    return;
-                                }
-
-                                data_received.notify_one();
-                            },
-                            res = session.payload().recv(&mut buf_tcp) => {
-                                match res {
-                                    Some(size) => {
-                                        if size > 0 {
-                                            if let Err(e) = udp_sock.send(&buf_tcp[..size]).await {
-                                                error!("Unable to send UDP packet to {}: {}, closing connection", e, remote_addr);
-                                                connections.finish(&session).await;
-                                                return;
-                                            }
-                                            data_received.notify_one();
-                                        } else {
-                                            trace!("Empty TCP packet received");
-                                        }
-                                    },
-                                    None => {
-                                        debug!("removed fake TCP socket from connections table");
-                                        connections.finish(&session).await;
-                                        return;
-                                    },
-                                }
-
-                                tcp_packet_received.notify_one();
-                            },
-                            _ = session.cancelled() => {
-                                debug!("worker {} terminated", i);
-                                return;
-                            },
-                        };
-                    }
-                });
-            }
-
-            let connections = connections.clone();
-            let keepalive_retries = tcp_keepalive_retries as u32;
-            tokio::spawn(async move {
-                let mut last_data_recv = Instant::now();
-                let mut keepalive = tcp_keepalive_time.map(|time| {
-                    KeepaliveTimer::new(
-                        established_at,
-                        time,
-                        tcp_keepalive_intvl,
-                        keepalive_retries,
-                    )
-                });
-
-                loop {
-                    let idle_deadline = last_data_recv + UDP_TTL;
-                    let probe_deadline = keepalive.as_ref().map(KeepaliveTimer::next_deadline);
-                    let deadline = probe_deadline.map_or(idle_deadline, |p| p.min(idle_deadline));
-
-                    tokio::select! {
-                        _ = time::sleep_until(deadline) => {
-                            let now = Instant::now();
-
-                            if let Some(timer) = keepalive.as_mut()
-                                && now >= timer.next_deadline()
-                            {
-                                if timer.probes_exhausted() {
-                                    info!("Connection {} TCP keep-alive retry exceeded", session.payload());
-                                    break;
-                                }
-
-                                trace!("Connection {} sending keep-alive {} / {}", session.payload(), timer.probes_sent() + 1, keepalive_retries);
-                                if !send_keepalive_session(&session).await {
-                                    warn!("Connection {} failed to send keep-alive, closing connection", session.payload());
-                                    break;
-                                }
-                                timer.probe_sent();
-                            }
-
-                            if now >= idle_deadline {
-                                info!("Connection {} No traffic seen in the last {:?}, closing connection", session.payload(), UDP_TTL);
-                                break;
-                            }
-                        },
-                        _ = session.cancelled() => {
-                            break;
-                        },
-                        _ = data_received.notified() => {
-                            last_data_recv = Instant::now();
-                        },
-                        _ = tcp_packet_received.notified() => {
-                            if let Some(timer) = keepalive.as_mut() {
-                                timer.on_incoming(Instant::now());
-                            }
-                        },
-                    }
-                }
-                debug!("removed fake TCP socket {} from connections table", session.payload());
-                connections.finish(&session).await;
-            });
-        }
-    });
-
-    tokio::join!(main_loop).0.unwrap()
+    phantun::client::run(
+        stack,
+        udp_sock,
+        BindPeerFactory::new(local_addr.port()),
+        config,
+        connections,
+    )
+    .await
 }
