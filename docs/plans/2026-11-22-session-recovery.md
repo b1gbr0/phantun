@@ -196,14 +196,14 @@ to the stand log. Verified in Task 9:
 
 ### Task 9: acceptance criteria check
 
-- [ ] `cargo build --release --workspace --locked`
-- [ ] `cargo clippy --workspace --all-targets --locked -- -D warnings`
-- [ ] `cargo test --workspace --locked`
-- [ ] the stand command from Task 8 completes successfully
-- [ ] without `--keepalive-time` no probes are sent; the CLI values and
+- [x] `cargo build --release --workspace --locked`
+- [x] `cargo clippy --workspace --all-targets --locked -- -D warnings`
+- [x] `cargo test --workspace --locked`
+- [x] the stand command from Task 8 completes successfully
+- [x] without `--keepalive-time` no probes are sent; the CLI values and
       meaning are preserved
-- [ ] the error-handling and idle-timer fixes also hold without keepalive
-- [ ] useful traffic pushes the idle deadline; without useful traffic the
+- [x] the error-handling and idle-timer fixes also hold without keepalive
+- [x] useful traffic pushes the idle deadline; without useful traffic the
       idle deadline arrives after `UDP_TTL` = 180 s
       (`phantun/src/lib.rs:5`), unless the session is terminated earlier for
       another reason; empty ACKs do not push the idle deadline
