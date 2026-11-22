@@ -174,7 +174,13 @@ impl Socket {
             State::Established => {
                 let buf = self.build_tcp_packet(tcp::TcpFlags::ACK, Some(payload));
                 self.seq.fetch_add(payload.len() as u32, Ordering::Relaxed);
-                self.tun.send(&buf).await.ok().and(Some(()))
+                match self.tun.send(&buf).await {
+                    Ok(_) => Some(()),
+                    Err(e) => {
+                        error!("{} unable to write datagram to the Tun device: {}", self, e);
+                        None
+                    }
+                }
             }
             _ => unreachable!(),
         }
@@ -202,7 +208,16 @@ impl Socket {
                     tcp::TcpFlags::ACK,
                     None,
                 );
-                self.tun.send(&buf).await.ok().and(Some(()))
+                match self.tun.send(&buf).await {
+                    Ok(_) => Some(()),
+                    Err(e) => {
+                        error!(
+                            "{} unable to write keepalive probe to the Tun device: {}",
+                            self, e
+                        );
+                        None
+                    }
+                }
             }
             _ => unreachable!(),
         }
