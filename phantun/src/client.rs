@@ -19,7 +19,7 @@ use std::time::Duration;
 
 use fake_tcp::packet::MAX_PACKET_LEN;
 use fake_tcp::{Socket, Stack};
-use log::{debug, error, info, trace, warn};
+use log::{debug, error, info, trace};
 use tokio::net::UdpSocket;
 use tokio::time::{self, Instant};
 
@@ -198,6 +198,66 @@ enum PayloadSend {
     Failed,
 }
 
+/// Why a session generation is being given up.
+///
+/// Every termination path names its reason, so the log records of different
+/// failures stay distinguishable.
+enum SessionEnd {
+    /// The configured number of keepalive probes went unanswered.
+    KeepaliveExhausted,
+    /// No payload traffic moved for [`UDP_TTL`].
+    IdleTimeout,
+    /// A write to the TUN device failed; the field says what was written.
+    TunWriteFailed(&'static str),
+    /// A keepalive probe stayed pending longer than [`KEEPALIVE_SEND_TIMEOUT`].
+    SendTimedOut,
+    /// Receiving from the local UDP peer failed.
+    UdpRecvFailed(io::Error),
+    /// The fake-TCP receive side was closed by the peer.
+    FakeTcpRecvClosed,
+}
+
+impl SessionEnd {
+    fn level(&self) -> log::Level {
+        match self {
+            Self::KeepaliveExhausted | Self::IdleTimeout => log::Level::Info,
+            Self::TunWriteFailed(_) | Self::UdpRecvFailed(_) => log::Level::Error,
+            Self::SendTimedOut => log::Level::Warn,
+            Self::FakeTcpRecvClosed => log::Level::Debug,
+        }
+    }
+
+    fn describe(&self) -> String {
+        match self {
+            Self::KeepaliveExhausted => "keepalive probes exhausted".to_owned(),
+            Self::IdleTimeout => format!("no traffic seen in the last {UDP_TTL:?}"),
+            Self::TunWriteFailed(what) => format!("unable to write {what} to the TUN device"),
+            Self::SendTimedOut => {
+                format!("keepalive probe still pending after {KEEPALIVE_SEND_TIMEOUT:?}")
+            }
+            Self::UdpRecvFailed(error) => format!("unable to receive local datagram: {error}"),
+            Self::FakeTcpRecvClosed => "fake-TCP receive closed".to_owned(),
+        }
+    }
+}
+
+/// Finishes `session` with one log record naming the reason, the session
+/// generation and the local UDP peer.
+async fn end_session<S: FakeTcpSocket>(
+    connections: &Connections<Arc<S>>,
+    session: &Session<Arc<S>>,
+    reason: SessionEnd,
+) {
+    log::log!(
+        reason.level(),
+        "Session {} for local UDP peer {}: {}, closing session",
+        session.generation(),
+        session.udp_remote_addr(),
+        reason.describe()
+    );
+    connections.finish(session).await;
+}
+
 /// Sends a datagram of `session`, interrupted as soon as the generation is
 /// finished.
 async fn send_payload<S: FakeTcpSocket>(session: &Session<Arc<S>>, payload: &[u8]) -> PayloadSend {
@@ -256,12 +316,12 @@ where
                     connections.finish(&session).await;
                 }
                 PayloadSend::Failed => {
-                    error!(
-                        "Session {} for local UDP peer {}: unable to write datagram to the TUN device, closing session",
-                        session.generation(),
-                        session.udp_remote_addr()
-                    );
-                    connections.finish(&session).await;
+                    end_session(
+                        &connections,
+                        &session,
+                        SessionEnd::TunWriteFailed("datagram"),
+                    )
+                    .await;
                 }
             }
             // The generation reference is dropped here, before the next receive
@@ -285,9 +345,17 @@ where
                 PayloadSend::Sent => {
                     debug!("Sent handshake packet for session {}", session.generation())
                 }
-                _ => {
-                    error!("Failed to send handshake packet to remote, closing connection.");
+                PayloadSend::Cancelled => {
                     connections.finish(&session).await;
+                    continue;
+                }
+                PayloadSend::Failed => {
+                    end_session(
+                        &connections,
+                        &session,
+                        SessionEnd::TunWriteFailed("handshake packet"),
+                    )
+                    .await;
                     continue;
                 }
             }
@@ -304,12 +372,12 @@ where
                 continue;
             }
             PayloadSend::Failed => {
-                error!(
-                    "Session {} for local UDP peer {}: unable to write the first datagram to the TUN device, closing session",
-                    session.generation(),
-                    session.udp_remote_addr()
-                );
-                connections.finish(&session).await;
+                end_session(
+                    &connections,
+                    &session,
+                    SessionEnd::TunWriteFailed("first datagram"),
+                )
+                .await;
                 continue;
             }
         }
@@ -382,24 +450,18 @@ async fn run_worker<S, P>(
                                 return;
                             }
                             PayloadSend::Failed => {
-                                error!(
-                                    "Session {} for local UDP peer {}: unable to write datagram to the TUN device, closing session",
-                                    session.generation(),
-                                    session.udp_remote_addr()
-                                );
-                                connections.finish(&session).await;
+                                end_session(
+                                    &connections,
+                                    &session,
+                                    SessionEnd::TunWriteFailed("datagram"),
+                                )
+                                .await;
                                 return;
                             }
                         }
                     }
                     Err(e) => {
-                        error!(
-                            "Session {} for local UDP peer {}: unable to receive local datagram: {}",
-                            session.generation(),
-                            session.udp_remote_addr(),
-                            e
-                        );
-                        connections.finish(&session).await;
+                        end_session(&connections, &session, SessionEnd::UdpRecvFailed(e)).await;
                         return;
                     }
                 }
@@ -434,12 +496,7 @@ async fn run_worker<S, P>(
                         session.notify_incoming();
                     }
                     None => {
-                        debug!(
-                            "Session {} for local UDP peer {}: fake-TCP receive closed",
-                            session.generation(),
-                            session.udp_remote_addr()
-                        );
-                        connections.finish(&session).await;
+                        end_session(&connections, &session, SessionEnd::FakeTcpRecvClosed).await;
                         return;
                     }
                 }
@@ -470,7 +527,7 @@ async fn run_manager<S: FakeTcpSocket>(
     });
     let mut pending: Option<PendingProbe<'_>> = None;
 
-    loop {
+    let reason = loop {
         if let Some(probe) = pending.take() {
             let PendingProbe {
                 mut send,
@@ -492,35 +549,16 @@ async fn run_manager<S: FakeTcpSocket>(
                                 timer.probe_sent();
                             }
                         }
-                        None => {
-                            warn!(
-                                "Session {} for local UDP peer {}: unable to write keepalive probe to the TUN device, closing session",
-                                session.generation(),
-                                session.udp_remote_addr()
-                            );
-                            break;
-                        }
+                        None => break Some(SessionEnd::TunWriteFailed("keepalive probe")),
                     }
                 }
                 _ = time::sleep_until(send_deadline) => {
-                    warn!(
-                        "Session {} for local UDP peer {}: keepalive probe still pending after {:?}, closing session",
-                        session.generation(),
-                        session.udp_remote_addr(),
-                        KEEPALIVE_SEND_TIMEOUT
-                    );
-                    break;
+                    break Some(SessionEnd::SendTimedOut);
                 }
                 _ = time::sleep_until(idle_deadline) => {
-                    info!(
-                        "Session {} for local UDP peer {}: No traffic seen in the last {:?}, closing session",
-                        session.generation(),
-                        session.udp_remote_addr(),
-                        UDP_TTL
-                    );
-                    break;
+                    break Some(SessionEnd::IdleTimeout);
                 }
-                _ = session.cancelled() => break,
+                _ = session.cancelled() => break None,
                 _ = session.activity() => {
                     last_data_recv = Instant::now();
                     requeue = true;
@@ -555,12 +593,7 @@ async fn run_manager<S: FakeTcpSocket>(
                     && now >= timer.next_deadline()
                 {
                     if timer.probes_exhausted() {
-                        info!(
-                            "Session {} for local UDP peer {}: keepalive retries exhausted, closing session",
-                            session.generation(),
-                            session.udp_remote_addr()
-                        );
-                        break;
+                        break Some(SessionEnd::KeepaliveExhausted);
                     }
 
                     let retries = keepalive_config.map_or(0, |config| config.retries);
@@ -580,16 +613,10 @@ async fn run_manager<S: FakeTcpSocket>(
                 }
 
                 if now >= idle_deadline {
-                    info!(
-                        "Session {} for local UDP peer {}: No traffic seen in the last {:?}, closing session",
-                        session.generation(),
-                        session.udp_remote_addr(),
-                        UDP_TTL
-                    );
-                    break;
+                    break Some(SessionEnd::IdleTimeout);
                 }
             }
-            _ = session.cancelled() => break,
+            _ = session.cancelled() => break None,
             _ = session.activity() => {
                 last_data_recv = Instant::now();
             }
@@ -599,14 +626,18 @@ async fn run_manager<S: FakeTcpSocket>(
                 }
             }
         }
-    }
+    };
 
     debug!(
         "Session {} for local UDP peer {}: manager stopped",
         session.generation(),
         session.udp_remote_addr()
     );
-    connections.finish(&session).await;
+    if let Some(reason) = reason {
+        end_session(&connections, &session, reason).await;
+    } else {
+        connections.finish(&session).await;
+    }
 }
 
 #[cfg(test)]

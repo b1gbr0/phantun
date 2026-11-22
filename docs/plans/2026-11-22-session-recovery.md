@@ -130,11 +130,11 @@ to the stand log. Verified in Task 9:
 
 ### Task 4: diagnostics of termination paths
 
-- [ ] causes are distinguished at least for: keepalive exhaustion, idle
+- [x] causes are distinguished at least for: keepalive exhaustion, idle
       timeout, TUN write error, send timeout, UDP receive error, fake-TCP
       receive close
-- [ ] log records contain the session id and the local UDP peer
-- [ ] the original TUN write error is kept in the log in both methods
+- [x] log records contain the session id and the local UDP peer
+- [x] the original TUN write error is kept in the log in both methods
       (`Socket::send`, `Socket::send_keepalive`) before it turns into `None`;
       the public `Option` contract is preserved
 
