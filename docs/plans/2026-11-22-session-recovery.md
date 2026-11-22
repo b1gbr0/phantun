@@ -166,13 +166,13 @@ to the stand log. Verified in Task 9:
 
 ### Task 7: isolated stand
 
-- [ ] processes and the veth network live in their own namespaces; forwarding,
+- [x] processes and the veth network live in their own namespaces; forwarding,
       routes and firewall are changed only there
-- [ ] the scenario needs no external network — numeric local addresses are
+- [x] the scenario needs no external network — numeric local addresses are
       enough
-- [ ] the old fake-TCP 4-tuple and the point where DROP applies relative to
+- [x] the old fake-TCP 4-tuple and the point where DROP applies relative to
       NAT are recorded; the rule also cuts empty ACKs of the old flow
-- [ ] the fact that the fake-TCP port is chosen randomly is taken into
+- [x] the fact that the fake-TCP port is chosen randomly is taken into
       account (`fake-tcp/src/lib.rs:443-454`): the newness of the tuple is
       checked, and a collision is handled by an explicit policy
 
