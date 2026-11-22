@@ -11,7 +11,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use tokio::sync::RwLock;
+use tokio::sync::{Notify, RwLock};
 use tokio_util::sync::CancellationToken;
 
 /// A single generation of a client session.
@@ -24,6 +24,8 @@ pub struct Session<T> {
     generation: u64,
     udp_remote_addr: SocketAddr,
     cancel: CancellationToken,
+    activity: Notify,
+    incoming: Notify,
     payload: T,
 }
 
@@ -56,6 +58,28 @@ impl<T> Session<T> {
     /// Whether this generation has already been finished.
     pub fn is_finished(&self) -> bool {
         self.cancel.is_cancelled()
+    }
+
+    /// Signals that a payload datagram of this session moved in either
+    /// direction. This keeps the idle timeout from firing but says nothing
+    /// about the peer being reachable.
+    pub fn notify_activity(&self) {
+        self.activity.notify_one();
+    }
+
+    /// Resolves on the next activity notification of this session.
+    pub async fn activity(&self) {
+        self.activity.notified().await;
+    }
+
+    /// Signals that a fake-TCP packet arrived for this session.
+    pub fn notify_incoming(&self) {
+        self.incoming.notify_one();
+    }
+
+    /// Resolves on the next incoming fake-TCP packet of this session.
+    pub async fn incoming(&self) {
+        self.incoming.notified().await;
     }
 }
 
@@ -96,6 +120,8 @@ impl<T> Connections<T> {
             generation,
             udp_remote_addr,
             cancel: CancellationToken::new(),
+            activity: Notify::new(),
+            incoming: Notify::new(),
             payload,
         });
 

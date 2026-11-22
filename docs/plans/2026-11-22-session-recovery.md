@@ -106,24 +106,24 @@ to the stand log. Verified in Task 9:
 
 ### Task 3: send and receive errors, activity accounting
 
-- [ ] a `Socket::send` error while sending a payload datagram from the main
+- [x] a `Socket::send` error while sending a payload datagram from the main
       loop or from any worker terminates the corresponding generation through
       the shared mechanism
-- [ ] cancelling a generation interrupts a pending `Socket::send` in the main
+- [x] cancelling a generation interrupts a pending `Socket::send` in the main
       loop as well as in the workers, and the workers' UDP sends too; after
       cancellation the main loop releases the reference to the old generation
       and keeps handling local UDP traffic; the table lock is not held across
       the `await`
-- [ ] waiting for keepalive does not block handling incoming activity,
+- [x] waiting for keepalive does not block handling incoming activity,
       cancellation, the idle deadline or the probe-exhaustion deadline; the
       keepalive has an explicit send timeout and a termination policy for it
-- [ ] the `Result` from `udp_sock.recv` is fully handled: on `Err` the cause,
+- [x] the `Result` from `udp_sock.recv` is fully handled: on `Err` the cause,
       the local UDP peer address and the session id are written, and then the
       session is terminated through the shared mechanism
-- [ ] a successful payload datagram through the main path counts as activity
+- [x] a successful payload datagram through the main path counts as activity
       of the same session — it prevents idle termination but **does not**
       reset the no-incoming-fake-TCP timer
-- [ ] the main loop and the workers are verified separately with
+- [x] the main loop and the workers are verified separately with
       never-completing stub sends: generation termination interrupts the
       pending sends and releases the old UDP sockets; the next local datagram
       lets a new generation be established without restarting the process
