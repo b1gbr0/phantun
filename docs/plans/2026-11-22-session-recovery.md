@@ -91,17 +91,17 @@ to the stand log. Verified in Task 9:
 
 ### Task 2: a probe timer independent of traffic
 
-- [ ] `t0` is the time of the last incoming fake-TCP packet (an empty ACK
+- [x] `t0` is the time of the last incoming fake-TCP packet (an empty ACK
       included); outgoing UDP packets do not move that anchor
-- [ ] probes are scheduled at `t0 + K + n × I`, termination at `t0 + K + R × I`;
+- [x] probes are scheduled at `t0 + K + n × I`, termination at `t0 + K + R × I`;
       send delays do not accumulate in the schedule
-- [ ] `n` is an integer from 0 to `R−1`; the initial `t0` is fixed when the
+- [x] `n` is an integer from 0 to `R−1`; the initial `t0` is fixed when the
       session is established
-- [ ] an incoming fake-TCP packet resets the probe budget
-- [ ] with `20/5/3` the probes fall at 20, 25 and 30 seconds, termination —
+- [x] an incoming fake-TCP packet resets the probe budget
+- [x] with `20/5/3` the probes fall at 20, 25 and 30 seconds, termination —
       at 35 seconds of virtual time
-- [ ] the idle timer works independently of keepalive
-- [ ] a send error or timeout may terminate the session earlier — that is
+- [x] the idle timer works independently of keepalive
+- [x] a send error or timeout may terminate the session earlier — that is
       intended behaviour, not a schedule failure
 
 ### Task 3: send and receive errors, activity accounting
