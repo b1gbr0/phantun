@@ -48,9 +48,37 @@ jobs:
           mv server phantun_server
           zip phantun_${{ matrix.target }}.zip phantun_client phantun_server
 
+      - name: Extract release notes from the tag annotation
+        # The annotated tag carries the hand-written release notes. Feed them to
+        # the release so its body matches the annotation verbatim — no
+        # auto-generated changelog, no manual `gh release edit` afterwards.
+        #
+        # The tag object is fetched explicitly and its type asserted: when the
+        # ref arrives lightweight, `%(contents)` silently returns the commit
+        # message instead of the annotation, and the release is published with
+        # the wrong body. A wrong-body release must be a red run.
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          git fetch --force origin "refs/tags/${TAG}:refs/tags/${TAG}"
+          type=$(git cat-file -t "refs/tags/${TAG}")
+          if [ "$type" != "tag" ]; then
+            echo "::error::${TAG} is a lightweight tag (object type: ${type}); release notes live in an annotated tag"
+            exit 1
+          fi
+          git tag -l --format='%(contents)' "$TAG" > /tmp/relnotes.md
+          if [ ! -s /tmp/relnotes.md ]; then
+            echo "::error::extracted release notes are empty"
+            exit 1
+          fi
+          echo "release notes (first lines):"
+          head -5 /tmp/relnotes.md
+
       - name: Upload Github Assets
         uses: softprops/action-gh-release@v2
         with:
           files: target/${{ matrix.target }}/release/*.zip
+          body_path: /tmp/relnotes.md
           prerelease: ${{ contains(github.ref, '-') }}
           update_existing: true
