@@ -279,7 +279,12 @@ async fn end_session<S: FakeTcpSocket>(
 /// Sends a datagram of `session`, interrupted as soon as the generation is
 /// finished.
 async fn send_payload<S: FakeTcpSocket>(session: &Session<Arc<S>>, payload: &[u8]) -> PayloadSend {
+    // A finished generation must never write again, even when the send is
+    // ready at the same moment as the cancellation. Without `biased` the two
+    // ready branches are polled in random order, so a cancelled generation
+    // would still send about half of the time.
     tokio::select! {
+        biased;
         _ = session.cancelled() => PayloadSend::Cancelled,
         res = session.payload().send(payload) => match res {
             Some(()) => PayloadSend::Sent,
@@ -510,8 +515,14 @@ async fn run_worker<S, P>(
             res = session.payload().recv(&mut buf_tcp) => {
                 match res {
                     Some(size) if size > 0 => {
+                        // The packet has arrived: anchor the keepalive
+                        // schedule to its receipt, not to how long forwarding
+                        // it to the local UDP peer takes. A stalled UDP send
+                        // must not look like a silent fake-TCP direction.
+                        session.notify_incoming();
                         let sent = peer.send(&buf_tcp[..size]);
                         tokio::select! {
+                            biased;
                             _ = session.cancelled() => {
                                 connections.finish(&session).await;
                                 return;
@@ -530,7 +541,6 @@ async fn run_worker<S, P>(
                                 }
                             }
                         }
-                        session.notify_incoming();
                     }
                     Some(_) => {
                         trace!("Empty TCP packet received");
@@ -1151,6 +1161,55 @@ mod tests {
 
         worker.await.unwrap();
         assert_eq!(dropped.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_generation_does_not_send_a_ready_payload() {
+        let connections = Connections::<Arc<FakeSocket>>::new();
+        let (socket, _tcp_tx) = fake_socket(SendBehavior::Ok, Arc::new(Notify::new()));
+        let sent = socket.sent.clone();
+        let session = connections.register(udp_peer(), Arc::new(socket)).await;
+
+        assert!(connections.finish(&session).await);
+
+        // Both branches are ready at the same time: the payload send would
+        // complete at once, and the generation is already cancelled. The
+        // cancellation has to win.
+        assert!(matches!(
+            send_payload(&session, b"payload").await,
+            PayloadSend::Cancelled
+        ));
+        assert!(sent.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn worker_reports_an_incoming_packet_before_the_local_send_completes() {
+        let peer = udp_peer();
+        let connections = Arc::new(Connections::<Arc<FakeSocket>>::new());
+        let (socket, tcp_tx) = fake_socket(SendBehavior::Ok, Arc::new(Notify::new()));
+        let session = connections.register(peer, Arc::new(socket)).await;
+
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let send_started = Arc::new(Notify::new());
+        let (worker_peer, _udp_tx) = fake_peer(true, send_started.clone(), dropped);
+        let worker = tokio::spawn(run_worker(
+            0,
+            session.clone(),
+            connections.clone(),
+            worker_peer,
+        ));
+
+        tcp_tx.send(vec![1u8; 4]).unwrap();
+        send_started.notified().await;
+
+        // The forward to the local UDP peer is still pending, but the packet
+        // has arrived: the keepalive schedule must already be anchored to it.
+        time::timeout(Duration::from_secs(1), session.incoming())
+            .await
+            .expect("an incoming packet is only reported after the local send completes");
+
+        assert!(connections.finish(&session).await);
+        worker.await.unwrap();
     }
 
     #[tokio::test]
