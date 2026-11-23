@@ -1,5 +1,9 @@
 # Client-side fake-TCP session self-recovery
 
+> **Closed 2026-11-23.** Every task is done, the external review converged on
+> the two defects it found, and the live check passed on a production channel.
+> Evidence is in [Outcome](#outcome).
+
 ## Why
 
 **Observation.** In operation, data transfer was reported to stop while the
@@ -234,3 +238,40 @@ to the stand log. Verified in Task 9:
 - As a separate task: the `server.rs:211-215` changes (the suppressed
   `udp_sock.recv` error, diagnostics on `sock.send`) — without them a
   UDP → fake-TCP direction failure is not detected while service ACKs are alive.
+
+## Outcome
+
+Closed 2026-11-23. Client binary built from this branch
+(`sha256 67b09254…`, x86_64, `rust:1-bookworm` cross target) and installed on
+the production client host; `server.rs` is unchanged, so the server was left
+as it was.
+
+Live check on a running channel (`--keepalive-time 20`, retries 3, interval
+5 s, so termination is due at `t0 + 35 s`):
+
+- both directions of the established fake-TCP flow were dropped with an
+  `iptables -F FORWARD` rule, so the session went silent rather than refused;
+- the client sent probes at +20, +25 and +30 s and then logged
+  `Session 4 for local UDP peer 127.0.0.1:40298: keepalive probes exhausted,
+  closing session` at +35 s;
+- while the blackhole was still in place the client kept retrying and failed;
+  once it was lifted, `Connection to <server>:443 established` appeared
+  within a second;
+- the process identifier stayed `2557402` across the whole sequence: no
+  `systemctl restart`, no service restart counter;
+- payload traffic through the channel resumed (`204` from a per-channel
+  probe) as soon as the new session was up.
+
+Two findings from the same run are worth keeping in mind:
+
+- the channel watchdog restarts the wrapper after a single failed probe, so
+  it masks self-recovery in normal operation; the check above ran with the
+  watchdog timer masked, and it was unmasked afterwards;
+- a blackhole in the outgoing direction alone is not enough to reproduce the
+  failure: the peer keeps answering, so the incoming direction must be cut as
+  well.
+
+Follow-up outside this plan: the client shipped here is a local build, not a
+release artifact, so the `my-vps` pin still points at the upstream version.
+The pin should move to a release that carries this fix before the next
+automatic install.
