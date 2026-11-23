@@ -275,6 +275,9 @@ cmd_setup() {
     fi
 
     mkdir -p "$RUN_DIR"
+    # Re-check after creation: the path is predictable, so a local user could
+    # have created it between the check above and this mkdir.
+    verify_state_path "$RUN_DIR" "run directory"
     SERVER_LOG=${STAND_SERVER_LOG:-$RUN_DIR/server.log}
     {
         printf 'STAND_PRIV=%q\n' "${STAND_PRIV:-}"

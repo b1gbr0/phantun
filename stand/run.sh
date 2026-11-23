@@ -162,6 +162,28 @@ resolve_tools_dir() {
     return 0
 }
 
+# The stand may run as root (preflight picks PRIV_MODE=root for id 0), and the
+# default log root lives in a world-writable $TMPDIR. Another local user could
+# pre-create it, a run directory below it, or a log file inside it as a
+# symlink, and the truncation in init_logging would then overwrite a file of
+# their choosing with our privileges. Refuse anything this user did not create
+# and keep the directory private; a directory we own and only we can write
+# cannot be populated behind our back afterwards. topology.sh and
+# resolve_tools_dir guard their paths the same way.
+resolve_log_dir() {
+    local dir=$1
+    [ -L "$dir" ] && die "refusing to use symlinked log directory $dir"
+    if [ -e "$dir" ]; then
+        [ -d "$dir" ] || die "refusing to use log path $dir: not a directory"
+        [ -O "$dir" ] || die "refusing to use log directory $dir: not owned by the current user"
+        chmod 700 "$dir" 2>/dev/null || true
+    else
+        mkdir -p "$dir"
+        chmod 700 "$dir" 2>/dev/null || true
+    fi
+    return 0
+}
+
 prepare() {
     command -v cargo >/dev/null 2>&1 || die "cargo is not installed"
     command -v rustc >/dev/null 2>&1 || die "rustc is not installed"
@@ -183,8 +205,9 @@ prepare() {
 }
 
 init_logging() {
+    resolve_log_dir "$LOG_ROOT"
     LOG_DIR=${STAND_LOG_DIR:-$LOG_ROOT/$(date +%Y%m%d-%H%M%S)-$$}
-    mkdir -p "$LOG_DIR"
+    resolve_log_dir "$LOG_DIR"
     RUN_LOG=$LOG_DIR/run.log
     STAND_RUN_DIR=${STAND_RUN_DIR:-${TMPDIR:-/tmp}/phantun-stand-state-$(id -u)-$$}
     export STAND_LOG_DIR=$LOG_DIR STAND_RUN_DIR STAND_SERVER_LOG=$LOG_DIR/server.log
@@ -210,11 +233,16 @@ init_logging() {
 }
 
 setup_topology() {
-    TOPOLOGY_STARTED=1
     log "topology: setup"
     if ! "$TOPOLOGY" setup >>"$RUN_LOG" 2>&1; then
+        # A failed setup creates nothing of its own: it refuses pre-existing
+        # namespaces before touching anything and removes whatever it created
+        # before failing. This invocation therefore owns no topology and the
+        # exit trap must not tear down or signal anyone else's.
         die "topology setup failed; see $RUN_LOG"
     fi
+    # From here on the namespaces belong to this invocation.
+    TOPOLOGY_STARTED=1
     if ! "$TOPOLOGY" check >>"$RUN_LOG" 2>&1; then
         die "topology isolation check failed; see $RUN_LOG"
     fi
@@ -296,8 +324,10 @@ cleanup() {
     for pid in ${CHILD_PIDS[@]+"${CHILD_PIDS[@]}"}; do
         kill "$pid" 2>/dev/null || true
     done
-    stop_stand_processes
+    # Without an owned topology this invocation started no stand processes, so
+    # a path-wide pkill would only reach another run's processes.
     if [ "$TOPOLOGY_STARTED" -eq 1 ]; then
+        stop_stand_processes
         "$STAND_TIMEOUT" "$CLEANUP_TIMEOUT_S" "$TOPOLOGY" teardown >>"$RUN_LOG" 2>&1 \
             || log "cleanup: topology teardown reported failure"
         TOPOLOGY_STARTED=0
@@ -736,7 +766,12 @@ run_cleanup_scenario() {
         log "cleanup-check/$mode: FAIL: stand resources left behind"
         report_leftovers "$STAND_CLIENT_NS" "$STAND_ROUTER_NS" "$STAND_SERVER_NS"
         ok=0
-        "$STAND_TIMEOUT" "$CLEANUP_TIMEOUT_S" "$TOPOLOGY" teardown >>"$RUN_LOG" 2>&1 || true
+        # Tear down only a topology this scenario created; without its state
+        # file the leftovers belong to another invocation.
+        if [ -f "$STAND_RUN_DIR/env" ]; then
+            stop_stand_processes
+            "$STAND_TIMEOUT" "$CLEANUP_TIMEOUT_S" "$TOPOLOGY" teardown >>"$RUN_LOG" 2>&1 || true
+        fi
     fi
 
     if [ "$ok" -eq 1 ]; then
@@ -792,8 +827,16 @@ cmd_run() {
     fi
 
     if check_leftovers; then
-        log "run: FAIL: stand resources left behind; tearing down"
-        "$STAND_TIMEOUT" "$CLEANUP_TIMEOUT_S" "$TOPOLOGY" teardown >>"$RUN_LOG" 2>&1 || true
+        if [ -f "$STAND_RUN_DIR/env" ]; then
+            log "run: FAIL: stand resources left behind; tearing down"
+            stop_stand_processes
+            "$STAND_TIMEOUT" "$CLEANUP_TIMEOUT_S" "$TOPOLOGY" teardown >>"$RUN_LOG" 2>&1 || true
+        else
+            # `env` is written by this invocation's successful setup. Without
+            # it these namespaces and processes belong to someone else, and
+            # this run must not destroy them.
+            log "run: FAIL: stand resources left behind by another run; leaving them alone"
+        fi
         rc=1
     fi
 
@@ -806,8 +849,9 @@ cmd_run() {
 }
 
 cmd_cleanup_check() {
+    resolve_log_dir "$LOG_ROOT"
     LOG_DIR=$LOG_ROOT/$(date +%Y%m%d-%H%M%S)-cleanup-check
-    mkdir -p "$LOG_DIR"
+    resolve_log_dir "$LOG_DIR"
     RUN_LOG=$LOG_DIR/run.log
     : >"$RUN_LOG"
     log "cleanup-check: log directory: $LOG_DIR"
@@ -820,8 +864,9 @@ cmd_cleanup_check() {
 # a crashed container, a one-shot VM about to be destroyed). Callers pass the
 # same STAND_RUN_DIR as the killed run when it was overridden.
 cmd_cleanup() {
+    resolve_log_dir "$LOG_ROOT"
     LOG_DIR=$LOG_ROOT/$(date +%Y%m%d-%H%M%S)-external-cleanup
-    mkdir -p "$LOG_DIR"
+    resolve_log_dir "$LOG_DIR"
     RUN_LOG=$LOG_DIR/run.log
     : >"$RUN_LOG"
     log "external cleanup: log directory: $LOG_DIR"
